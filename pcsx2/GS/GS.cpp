@@ -1524,6 +1524,22 @@ void GSReleaseExportIOSurface(void* iosurface)
 	if (g_gs_device && GSCurrentRenderer == GSRendererType::Metal)
 		MT_ReleaseExportIOSurface(g_gs_device.get(), iosurface);
 }
+
+int GSCompositeHudIOSurface(void* iosurface, const void* scene, u32 sceneSize, const u8* atlasPx,
+	u32 atlasW, u32 atlasH, u64 atlasId, u64* done_token)
+{
+	if (!g_gs_renderer || !g_gs_device || !g_gs_device->GetCurrent() || !iosurface || !done_token)
+		return 0;
+	if (GSCurrentRenderer != GSRendererType::Metal)
+		return 0;
+	// HUD5: no drain (the composite records on its own command buffer, never
+	// the worker's; the export it composites is already GPU-complete — the
+	// runtime calls this after the export's completion handler fired).
+	return MT_CompositeHudIOSurface(g_gs_device.get(), iosurface, scene, sceneSize, atlasPx, atlasW,
+		atlasH, atlasId, done_token)
+	       ? 1
+	       : -1;
+}
 #endif
 
 #ifdef _WIN32
