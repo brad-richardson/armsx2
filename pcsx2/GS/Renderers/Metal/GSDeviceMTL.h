@@ -302,6 +302,25 @@ public:
 		std::unique_ptr<GSTextureMTL> wrapper;
 	};
 	std::unordered_map<void*, IOSurfaceExport> m_export_surfaces;
+	// HUD5: Tricky HUD Metal composite state (see GS.h). The pipeline compiles
+	// once from the embedded MSL source (synchronously, on the caller's
+	// thread — the runtime calls this off the GS worker); temp/atlas/scene
+	// are 1-deep shared buffers reused across composites (each call waits for
+	// its own command buffer, so reuse is safe). Composites never overlap
+	// each other (the runtime serializes them: helper FIFO or pool mutex), so
+	// m_hud_mutex guards only the m_export_surfaces map (worker exports vs
+	// helper composites); the composite retains its surface texture under it.
+	MRCOwned<id<MTLComputePipelineState>> m_hud_pipeline;
+	MRCOwned<id<MTLBuffer>> m_hud_scene_buffer;
+	MRCOwned<id<MTLBuffer>> m_hud_dims_buffer; // atlasW/H (+pad), 16 bytes, rewritten per composite
+	MRCOwned<id<MTLBuffer>> m_hud_temp_buffer;
+	u32 m_hud_temp_w = 0, m_hud_temp_h = 0;
+	MRCOwned<id<MTLBuffer>> m_hud_atlas_buffer;
+	u64 m_hud_atlas_id = 0;
+	u32 m_hud_atlas_w = 0, m_hud_atlas_h = 0;
+	u64 m_hud_done_seq = 0;
+	bool m_hud_failed = false; // a resource build failed; refuse until re-init (fail-closed)
+	std::mutex m_hud_mutex;
 
 	id<MTLRenderPipelineState> GetConvertPipeline(ShaderConvertSelector shader) const
 	{
@@ -436,6 +455,17 @@ public:
 		GSExportIOSurfaceDoneFn done, void* ctx);
 	/// GI1: drop the cached wrapper for a surface (call before releasing it).
 	void ReleaseExportIOSurface(void* iosurface);
+	/// HUD5: composite one Tricky HUD scene onto a completed IOSurface export
+	/// (own command buffer on the shared queue; synchronous). See GS.h.
+	bool CompositeHudIOSurface(void* iosurface, const void* scene, u32 sceneSize, const u8* atlasPx,
+		u32 atlasW, u32 atlasH, u64 atlasId, u64* done_token);
+	/// HUD5: create the HUD compute pipeline once (locked; fail-closed).
+	bool EnsureHudPipeline();
+	/// HUD5: run one dummy composite (scratch blit + dispatch) so the first
+	/// real composite never pays a cold driver compile. Called on the GS
+	/// worker from the export path; failure is silent (the real composite
+	/// retries cold, today's behavior).
+	void WarmupHudComposite();
 	/// End current render pass without flushing
 	void EndRenderPass();
 	/// Prepare to begin a new render pass

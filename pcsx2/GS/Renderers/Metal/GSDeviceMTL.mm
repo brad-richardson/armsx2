@@ -469,29 +469,43 @@ bool GSDeviceMTL::CopySnapshotToIOSurface(GSTexture* source, void* iosurface, u3
 	if (pad_x + static_cast<u32>(source->GetWidth()) > width ||
 		pad_y + static_cast<u32>(source->GetHeight()) > height)
 		return fail("source does not fit the surface");
-	auto found = m_export_surfaces.find(iosurface);
-	if (found == m_export_surfaces.end())
+	// HUD5: the map is shared with the helper thread's composites; hold the
+	// mutex only for the lookup/creation, then encode with locals.
+	GSTextureMTL* surfWrap = nullptr;
 	{
-		MTLTextureDescriptor* desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
-		                                                                                 width:width
-		                                                                                height:height
-		                                                                             mipmapped:NO];
-		desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
-		id<MTLTexture> tex = [m_dev.dev newTextureWithDescriptor:desc iosurface:surface plane:0];
-		if (!tex)
-			return fail("newTextureWithDescriptor:iosurface: failed");
-		IOSurfaceExport entry;
-		entry.width = width;
-		entry.height = height;
-		entry.texture = MRCTransfer(tex);
-		entry.wrapper = std::make_unique<GSTextureMTL>(this, entry.texture, nil, GSTexture::Usage::RenderTarget,
-			GSTexture::Format::Color);
-		entry.wrapper->SetSize(GSVector2i(static_cast<int>(width), static_cast<int>(height)));
-		found = m_export_surfaces.emplace(iosurface, std::move(entry)).first;
+		std::lock_guard<std::mutex> lock(m_hud_mutex);
+		auto found = m_export_surfaces.find(iosurface);
+		if (found == m_export_surfaces.end())
+		{
+			MTLTextureDescriptor* desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+			                                                                                 width:width
+			                                                                                height:height
+			                                                                             mipmapped:NO];
+			// HUD5: ShaderWrite for the Tricky HUD compute composite (it
+			// writes the composited pixels back through this texture).
+			desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+			id<MTLTexture> tex = [m_dev.dev newTextureWithDescriptor:desc iosurface:surface plane:0];
+			if (!tex)
+				return fail("newTextureWithDescriptor:iosurface: failed");
+			IOSurfaceExport entry;
+			entry.width = width;
+			entry.height = height;
+			entry.texture = MRCTransfer(tex);
+			entry.wrapper = std::make_unique<GSTextureMTL>(this, entry.texture, nil, GSTexture::Usage::RenderTarget,
+				GSTexture::Format::Color);
+			entry.wrapper->SetSize(GSVector2i(static_cast<int>(width), static_cast<int>(height)));
+			found = m_export_surfaces.emplace(iosurface, std::move(entry)).first;
+		}
+		IOSurfaceExport& entry = found->second;
+		if (entry.width != width || entry.height != height)
+			return fail("cached IOSurface dimensions changed");
+		surfWrap = entry.wrapper.get();
 	}
-	IOSurfaceExport& entry = found->second;
-	if (entry.width != width || entry.height != height)
-		return fail("cached IOSurface dimensions changed");
+	// HUD5: warm up the Tricky HUD composite (pipeline + one dummy blit and
+	// dispatch) on this worker thread, before any helper composite can race
+	// a cold driver compile. One-time; silent unless it fails.
+	if (!m_hud_pipeline && !m_hud_failed)
+		WarmupHudComposite();
 	if (!m_iosurface_copy_pipeline)
 	{
 		auto pdesc = [[MTLRenderPipelineDescriptor new] autorelease];
@@ -507,8 +521,8 @@ bool GSDeviceMTL::CopySnapshotToIOSurface(GSTexture* source, void* iosurface, u3
 	FlushClears(source);
 	EndRenderPass();
 	// Opaque-black clear every export: pad regions (if any) are display-black.
-	entry.wrapper->SetClearColor(0xFF000000);
-	BeginStretchRect(@"GI1 IOSurface export", entry.wrapper.get(), MTLLoadActionLoad);
+	surfWrap->SetClearColor(0xFF000000);
+	BeginStretchRect(@"GI1 IOSurface export", surfWrap, MTLLoadActionLoad);
 	MRESetPipeline(m_iosurface_copy_pipeline);
 	MRESetTexture(source, GSMTLTextureIndexNonHW);
 	MRESetSampler(SamplerSelector::Point());
@@ -527,7 +541,528 @@ bool GSDeviceMTL::CopySnapshotToIOSurface(GSTexture* source, void* iosurface, u3
 
 void GSDeviceMTL::ReleaseExportIOSurface(void* iosurface)
 {
+	std::lock_guard<std::mutex> lock(m_hud_mutex);
 	m_export_surfaces.erase(iosurface);
+}
+
+// HUD5: Tricky HUD composite (GSCompositeHudIOSurface). One compute dispatch
+// per scene over the HUD region: a blit first copies the pristine region into
+// the temp buffer, then each invocation carries its pixel's dst chain in
+// registers, so the single dispatch reproduces the CPU's smear-then-quads
+// order exactly. The mirror struct below must match the runtime's Ge1HudScene
+// byte for byte (all members 4 bytes, no padding); magic + exact size are
+// checked, fail-closed, so any drift refuses loudly instead of misdrawing.
+struct HudSceneBlobMTL
+{
+	u32 magic, version;
+	s32 regionX, regionY, regionW, regionH;
+	s32 nsmears;
+	s32 smearX0[2], smearY0[2], smearX1[2], smearY1[2];
+	s32 smearLX[2], smearRX[2];
+	s32 nquads;
+	s32 quadSrcX[26], quadSrcY[26], quadSrcW[26], quadSrcH[26];
+	s32 quadDX[26], quadDY[26], quadDW[26], quadDH[26];
+	float quadDim[26];
+};
+static_assert(sizeof(HudSceneBlobMTL) == 1016, "HudSceneBlobMTL must match Ge1HudScene");
+static_assert(offsetof(HudSceneBlobMTL, regionX) == 8, "HudSceneBlobMTL layout");
+static_assert(offsetof(HudSceneBlobMTL, nsmears) == 24, "HudSceneBlobMTL layout");
+static_assert(offsetof(HudSceneBlobMTL, nquads) == 76, "HudSceneBlobMTL layout");
+static_assert(offsetof(HudSceneBlobMTL, quadSrcX) == 80, "HudSceneBlobMTL layout");
+static_assert(offsetof(HudSceneBlobMTL, quadDim) == 912, "HudSceneBlobMTL layout");
+static constexpr u32 HUD_MTL_SCENE_MAGIC = 0x44554847u; // 'HUDG'
+static constexpr u32 HUD_MTL_SCENE_VERSION = 1u;
+
+// The composite kernel. A verbatim port of the Vulkan HUD_COMPOSITE_SHADER
+// (HUD4, pixel-gated at max 1 on the Odin): every float expression mirrors
+// the CPU reference (sampleAtlas / blendSample / smearCoverS) in the same
+// operation order (compiled with fastMathEnabled=NO, so no reassociation or
+// contraction: per-op IEEE, like the CPU's -ffp-contract=off), and each
+// smear and each quad rounds to u8 before the next draw reads it. MSL has no
+// GLSL-style precise qualifier (metal::precise is a math-function namespace),
+// hence the compile flag. Two Metal adaptations:
+// (1) temp/atlas are raw-byte buffers (a blit fills the temp; no UNORM/UINT
+// texture reinterpret), (2) BGRA lanes (THD1): the surface stores B,G,R,A,
+// so the kernel unswaps to RGB on load and swaps back on store. Pixels no
+// draw touches are never written. Compiled once from source (no metallib
+// plumbing); the one-time compile runs on the caller's thread, off the GS
+// worker by the runtime's contract.
+static constexpr char HUD_MTL_COMPOSITE_MSL[] = R"(
+#include <metal_stdlib>
+using namespace metal;
+
+struct HudSceneBlob
+{
+	uint magic;
+	uint version;
+	int regionX, regionY, regionW, regionH;
+	int nsmears;
+	int smearX0[2];
+	int smearY0[2];
+	int smearX1[2];
+	int smearY1[2];
+	int smearLX[2];
+	int smearRX[2];
+	int nquads;
+	int quadSrcX[26];
+	int quadSrcY[26];
+	int quadSrcW[26];
+	int quadSrcH[26];
+	int quadDX[26];
+	int quadDY[26];
+	int quadDW[26];
+	int quadDH[26];
+	float quadDim[26];
+};
+
+// First-dispatch rule: a cold first dispatch of this kernel wedges the queue
+// about half the time (helper stuck in waitUntilCompleted, worker piled
+// behind it, guest stalled; lldb-proven). The host warms it up (dummy blit
+// + dispatch on the worker, pre-race); never dispatch it cold from a helper.
+kernel void hud_composite(
+	uint2 gid [[thread_position_in_grid]],
+	uint2 tgid [[threadgroup_position_in_grid]],
+	device const HudSceneBlob* sc [[buffer(0)]],
+	device const uchar* temp [[buffer(1)]],
+	device const uchar* atlas [[buffer(2)]],
+	device const uint2* atlasWH [[buffer(3)]],
+	texture2d<float, access::write> frame [[texture(0)]])
+{
+	int px = int(gid.x);
+	int py = int(gid.y);
+	if (px >= sc->regionW || py >= sc->regionH)
+		return;
+	// Tile reject: the workgroup's 16x16 footprint is uniform, so an
+	// item disjoint from it fails every thread's clip below; skipping
+	// it is bit-exact (order and math untouched).
+	int tx0 = int(tgid.x) * 16, ty0 = int(tgid.y) * 16;
+	int tx1 = tx0 + 16, ty1 = ty0 + 16;
+	// Temp row pitch, 64-byte aligned (same formula as the host blit args).
+	uint tRow = ((uint(sc->regionW) << 2u) + 63u) & ~63u;
+	uint tbase = uint(py) * tRow + uint(px) * 4u;
+	// BGRA memory order: byte0=B, byte1=G, byte2=R; math runs in RGB.
+	float b0 = temp[tbase + 0];
+	float g0 = temp[tbase + 1];
+	float r0 = temp[tbase + 2];
+	float dstA = temp[tbase + 3];
+	float3 dst = float3(r0, g0, b0);
+	bool covered = false;
+	for (int i = 0; i < sc->nsmears; i++)
+	{
+		// smearCoverS in region coords (clip test here, feather on the
+		// unclipped rect, edge columns from the blob, temp reads).
+		int x0 = sc->smearX0[i] - sc->regionX, y0 = sc->smearY0[i] - sc->regionY;
+		int x1 = sc->smearX1[i] - sc->regionX, y1 = sc->smearY1[i] - sc->regionY;
+		if (x1 <= x0 || y1 <= y0)
+			continue;
+		int xa = x0 < 0 ? 0 : x0;
+		int xb = x1 > sc->regionW ? sc->regionW : x1;
+		int ya = y0 < 0 ? 0 : y0;
+		int yb = y1 > sc->regionH ? sc->regionH : y1;
+		if (tx1 <= xa || tx0 >= xb || ty1 <= ya || ty0 >= yb)
+			continue;
+		if (px < xa || px >= xb || py < ya || py >= yb)
+			continue;
+		float span = float(x1 - x0);
+		int lx = sc->smearLX[i] - sc->regionX;
+		int rx = sc->smearRX[i] - sc->regionX;
+		uint lbase = uint(py) * tRow + uint(lx) * 4u;
+		uint rbase = uint(py) * tRow + uint(rx) * 4u;
+		float lr = temp[lbase + 2], lg = temp[lbase + 1], lb = temp[lbase + 0];
+		float rr = temp[rbase + 2], rg = temp[rbase + 1], rb = temp[rbase + 0];
+		float fy0 = float(py - y0) / 3.0f;
+		float fy1 = float(y1 - py) / 3.0f;
+		float t = float(px - x0) / span;
+		float a = fy0;
+		if (fy1 < a)
+			a = fy1;
+		float fx0 = float(px - x0) / 2.0f;
+		float fx1 = float(x1 - px) / 2.0f;
+		if (fx0 < a)
+			a = fx0;
+		if (fx1 < a)
+			a = fx1;
+		if (a <= 0.0f)
+			continue;
+		if (a > 1.0f)
+			a = 1.0f;
+		float ia = 1.0f - a;
+		float3 sm = (float3(lr, lg, lb) + (float3(rr, rg, rb) - float3(lr, lg, lb)) * t) * a + dst * ia;
+		dst = floor(sm + 0.5f);
+		covered = true;
+	}
+	for (int q = 0; q < sc->nquads; q++)
+	{
+		int dx = sc->quadDX[q] - sc->regionX, dy = sc->quadDY[q] - sc->regionY;
+		int dw = sc->quadDW[q], dh = sc->quadDH[q];
+		if (dw <= 0 || dh <= 0)
+			continue;
+		int xa = dx < 0 ? 0 : dx;
+		int xb = dx + dw > sc->regionW ? sc->regionW : dx + dw;
+		int ya = dy < 0 ? 0 : dy;
+		int yb = dy + dh > sc->regionH ? sc->regionH : dy + dh;
+		if (tx1 <= xa || tx0 >= xb || ty1 <= ya || ty0 >= yb)
+			continue;
+		if (px < xa || px >= xb || py < ya || py >= yb)
+			continue;
+		int sx = sc->quadSrcX[q], sy = sc->quadSrcY[q], sw = sc->quadSrcW[q], sh = sc->quadSrcH[q];
+		int rx = px - dx, ry = py - dy;
+		float v = (float(ry) + 0.5f) * float(sh) / float(dh) - 0.5f;
+		int v0 = int(floor(v));
+		float fv = v - float(v0);
+		if (v0 < 0)
+		{
+			v0 = 0;
+			fv = 0.0f;
+		}
+		if (v0 > sh - 2)
+		{
+			v0 = sh - 2;
+			fv = 1.0f;
+		}
+		if (sh < 2)
+		{
+			v0 = 0;
+			fv = 0.0f;
+		}
+		float u = (float(rx) + 0.5f) * float(sw) / float(dw) - 0.5f;
+		int u0 = int(floor(u));
+		float fu = u - float(u0);
+		if (u0 < 0)
+		{
+			u0 = 0;
+			fu = 0.0f;
+		}
+		if (u0 > sw - 2)
+		{
+			u0 = sw - 2;
+			fu = 1.0f;
+		}
+		if (sw < 2)
+		{
+			u0 = 0;
+			fu = 0.0f;
+		}
+		uint a00 = (uint(sy + v0) * atlasWH->x + uint(sx + u0)) * 4u;
+		uint a10 = a00 + 4u;
+		uint a01 = a00 + atlasWH->x * 4u;
+		uint a11 = a01 + 4u;
+		float w00 = (1.0f - fu) * (1.0f - fv);
+		float w10 = fu * (1.0f - fv);
+		float w01 = (1.0f - fu) * fv;
+		float w11 = fu * fv;
+		float dim = sc->quadDim[q];
+		float sr = (float(atlas[a00 + 0]) * w00 + float(atlas[a10 + 0]) * w10 + float(atlas[a01 + 0]) * w01 + float(atlas[a11 + 0]) * w11) * dim;
+		float sg = (float(atlas[a00 + 1]) * w00 + float(atlas[a10 + 1]) * w10 + float(atlas[a01 + 1]) * w01 + float(atlas[a11 + 1]) * w11) * dim;
+		float sb = (float(atlas[a00 + 2]) * w00 + float(atlas[a10 + 2]) * w10 + float(atlas[a01 + 2]) * w01 + float(atlas[a11 + 2]) * w11) * dim;
+		float sa = (float(atlas[a00 + 3]) * w00 + float(atlas[a10 + 3]) * w10 + float(atlas[a01 + 3]) * w01 + float(atlas[a11 + 3]) * w11) / 255.0f;
+		if (sa <= 0.0f)
+			continue;
+		float ia = 1.0f - sa;
+		dst = floor(float3(sr, sg, sb) * sa + dst * ia + 0.5f);
+		dstA = 255.0f;
+		covered = true;
+	}
+	if (!covered)
+		return;
+	// Exact integers through the UNORM view: N/255 round-trips to N (the
+	// conversion error is < 2^-16 against a 0.5 margin). Semantic RGBA
+	// order: the BGRA texture swizzles to B,G,R,A memory itself (a raw
+	// UINT image would not — the Vulkan kernel's store order does not
+	// transfer).
+	frame.write(float4(dst.r, dst.g, dst.b, dstA) / 255.0f,
+		uint2(uint(sc->regionX + px), uint(sc->regionY + py)));
+}
+)";
+
+bool GSDeviceMTL::EnsureHudPipeline()
+{
+	std::lock_guard<std::mutex> lock(m_hud_mutex);
+	if (m_hud_pipeline)
+		return true;
+	if (m_hud_failed)
+		return false;
+	// Per-op IEEE math (no contraction/reassociation), matching the CPU
+	// reference's -ffp-contract=off: the MSL-side half of the exactness
+	// contract (the other half is the mirrored operation order above).
+	MTLCompileOptions* mtlOpts = [[MTLCompileOptions new] autorelease];
+	mtlOpts.fastMathEnabled = NO;
+	NSError* libErr = nil;
+	MRCOwned<id<MTLLibrary>> lib = MRCTransfer([m_dev.dev
+		newLibraryWithSource:[NSString stringWithUTF8String:HUD_MTL_COMPOSITE_MSL]
+		                  options:mtlOpts
+		                    error:&libErr]);
+	if (!lib)
+	{
+		std::fprintf(stderr, "GE1 HUD Metal composite: MSL compile failed: %s\n",
+			libErr ? [[libErr localizedDescription] UTF8String] : "(no error)");
+		m_hud_failed = true;
+		return false;
+	}
+	MRCOwned<id<MTLFunction>> fn = MRCTransfer([lib newFunctionWithName:@"hud_composite"]);
+	if (!fn)
+	{
+		m_hud_failed = true;
+		return false;
+	}
+	NSError* pipeErr = nil;
+	MRCOwned<id<MTLComputePipelineState>> pipe =
+		MRCTransfer([m_dev.dev newComputePipelineStateWithFunction:fn error:&pipeErr]);
+	if (!pipe)
+	{
+		std::fprintf(stderr, "GE1 HUD Metal composite: pipeline failed: %s\n",
+			pipeErr ? [[pipeErr localizedDescription] UTF8String] : "(no error)");
+		m_hud_failed = true;
+		return false;
+	}
+	m_hud_pipeline = std::move(pipe);
+	std::fprintf(stderr, "GE1 HUD Metal composite: pipeline ready\n");
+	return true;
+}
+
+void GSDeviceMTL::WarmupHudComposite()
+{ @autoreleasepool {
+	// HUD5: a cold first dispatch wedges the queue about half the time
+	// (lldb: helper stuck in waitUntilCompleted on composite #1, worker's
+	// snapshot piled behind it, slots exhausted, guest stalled; later runs
+	// with a warm driver cache never hang). Run one dummy blit + dispatch
+	// here, on the worker, before any composite can race it. Scratch-only:
+	// no shared state but the pipeline (locked above), so this cannot race
+	// the worker's open render work. Failure is silent (the first real
+	// composite retries cold, today's behavior).
+	if (!EnsureHudPipeline())
+		return;
+	MTLTextureDescriptor* desc =
+		[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+		                                                   width:4
+		                                                  height:4
+		                                               mipmapped:NO];
+	desc.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+	MRCOwned<id<MTLTexture>> scratchTex = MRCTransfer([m_dev.dev newTextureWithDescriptor:desc]);
+	MRCOwned<id<MTLBuffer>> sceneBuf =
+		MRCTransfer([m_dev.dev newBufferWithLength:sizeof(HudSceneBlobMTL)
+		                                   options:MTLResourceStorageModeShared]);
+	MRCOwned<id<MTLBuffer>> tempBuf =
+		MRCTransfer([m_dev.dev newBufferWithLength:256 options:MTLResourceStorageModeShared]);
+	MRCOwned<id<MTLBuffer>> atlasBuf =
+		MRCTransfer([m_dev.dev newBufferWithLength:64 options:MTLResourceStorageModeShared]);
+	MRCOwned<id<MTLBuffer>> dimsBuf =
+		MRCTransfer([m_dev.dev newBufferWithLength:16 options:MTLResourceStorageModeShared]);
+	if (!scratchTex || !sceneBuf || !tempBuf || !atlasBuf || !dimsBuf)
+		return;
+	std::memset([sceneBuf contents], 0, sizeof(HudSceneBlobMTL)); // regionW=0: dispatch binds but draws nothing
+	const u32 dims[2] = {4, 4};
+	std::memcpy([dimsBuf contents], dims, sizeof(dims));
+	id<MTLCommandBuffer> cmd = [m_queue commandBuffer];
+	if (!cmd)
+		return;
+	id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
+	[blit copyFromTexture:scratchTex
+	            sourceSlice:0
+	            sourceLevel:0
+	           sourceOrigin:MTLOriginMake(0, 0, 0)
+	             sourceSize:MTLSizeMake(4, 4, 1)
+	               toBuffer:tempBuf
+	      destinationOffset:0
+	 destinationBytesPerRow:64
+	destinationBytesPerImage:256];
+	[blit endEncoding];
+	id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+	[enc setComputePipelineState:m_hud_pipeline];
+	[enc setBuffer:sceneBuf offset:0 atIndex:0];
+	[enc setBuffer:tempBuf offset:0 atIndex:1];
+	[enc setBuffer:atlasBuf offset:0 atIndex:2];
+	[enc setBuffer:dimsBuf offset:0 atIndex:3];
+	[enc setTexture:scratchTex atIndex:0];
+	[enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+	[enc endEncoding];
+	[cmd commit];
+	[cmd waitUntilCompleted];
+	if (cmd.status == MTLCommandBufferStatusCompleted)
+		std::fprintf(stderr, "GE1 HUD Metal composite: warmup done\n");
+}}
+
+bool GSDeviceMTL::CompositeHudIOSurface(void* iosurface, const void* scene, u32 sceneSize,
+	const u8* atlasPx, u32 atlasW, u32 atlasH, u64 atlasId, u64* done_token)
+{ @autoreleasepool {
+	auto fail = [](const char* why) { std::fprintf(stderr, "GE1 HUD Metal composite: %s\n", why); return false; };
+	if (!iosurface || !scene || !atlasPx || !done_token || !m_dev.dev || !m_queue)
+		return fail("invalid arguments");
+	if (sceneSize != sizeof(HudSceneBlobMTL))
+		return fail("scene size mismatch");
+	const HudSceneBlobMTL* sc = static_cast<const HudSceneBlobMTL*>(scene);
+	if (sc->magic != HUD_MTL_SCENE_MAGIC || sc->version != HUD_MTL_SCENE_VERSION)
+		return fail("scene magic/version mismatch");
+	if (sc->nsmears < 0 || sc->nsmears > 2 || sc->nquads <= 0 || sc->nquads > 26)
+		return fail("scene counts out of range");
+	if (sc->regionW <= 0 || sc->regionH <= 0 || sc->regionW > 8192 || sc->regionH > 8192)
+		return fail("region out of range");
+	if (atlasW == 0 || atlasH == 0 || atlasW > 1024 || atlasH > 1024)
+		return fail("atlas dimensions out of range");
+	IOSurfaceRef surface = static_cast<IOSurfaceRef>(iosurface);
+	const s32 frameW = static_cast<s32>(IOSurfaceGetWidth(surface));
+	const s32 frameH = static_cast<s32>(IOSurfaceGetHeight(surface));
+	if (IOSurfaceGetPixelFormat(surface) != kCVPixelFormatType_32BGRA)
+		return fail("surface is not 32BGRA");
+	if (sc->regionX < 0 || sc->regionY < 0 || sc->regionX + sc->regionW > frameW ||
+	    sc->regionY + sc->regionH > frameH)
+		return fail("region outside the export");
+	for (int i = 0; i < sc->nsmears; i++)
+	{
+		if (sc->smearX1[i] <= sc->smearX0[i] || sc->smearY1[i] <= sc->smearY0[i])
+			return fail("degenerate smear");
+		if (sc->smearLX[i] < sc->regionX || sc->smearRX[i] < sc->regionX ||
+		    sc->smearLX[i] >= sc->regionX + sc->regionW || sc->smearRX[i] >= sc->regionX + sc->regionW)
+			return fail("smear edge outside the region");
+	}
+	for (int q = 0; q < sc->nquads; q++)
+	{
+		if (sc->quadSrcX[q] < 0 || sc->quadSrcY[q] < 0 || sc->quadSrcW[q] < 2 || sc->quadSrcH[q] < 2 ||
+		    sc->quadSrcX[q] + sc->quadSrcW[q] > static_cast<s32>(atlasW) ||
+		    sc->quadSrcY[q] + sc->quadSrcH[q] > static_cast<s32>(atlasH))
+			return fail("quad src outside the atlas");
+	}
+	if (m_hud_failed)
+		return fail("resources failed before (fail-closed)");
+	// The cached export texture, retained under the map lock (a release racing
+	// this composite then cannot free it under the encode below).
+	MRCOwned<id<MTLTexture>> surfTex;
+	{
+		std::lock_guard<std::mutex> lock(m_hud_mutex);
+		auto found = m_export_surfaces.find(iosurface);
+		if (found == m_export_surfaces.end())
+			return fail("surface was never exported");
+		if (found->second.width != static_cast<u32>(frameW) || found->second.height != static_cast<u32>(frameH))
+			return fail("cached IOSurface dimensions changed");
+		surfTex = found->second.texture;
+	}
+	// The pipeline, compiled once from source (see EnsureHudPipeline; the
+	// export path warms it up on the worker before any composite can race).
+	if (!EnsureHudPipeline())
+		return fail("HUD pipeline unavailable");
+	// Scene blob buffer, created once (1016 B, shared; rewritten per
+	// composite — 1-deep reuse is safe: every call waits for its own work).
+	if (!m_hud_scene_buffer)
+	{
+		m_hud_scene_buffer =
+			MRCTransfer([m_dev.dev newBufferWithLength:sizeof(HudSceneBlobMTL)
+			                                  options:MTLResourceStorageModeShared]);
+		if (!m_hud_scene_buffer)
+		{
+			m_hud_failed = true;
+			return fail("scene buffer failed");
+		}
+	}
+	std::memcpy([m_hud_scene_buffer contents], sc, sizeof(HudSceneBlobMTL));
+	if (!m_hud_dims_buffer)
+	{
+		m_hud_dims_buffer = MRCTransfer(
+			[m_dev.dev newBufferWithLength:16 options:MTLResourceStorageModeShared]);
+		if (!m_hud_dims_buffer)
+		{
+			m_hud_failed = true;
+			return fail("dims buffer failed");
+		}
+	}
+	static_assert(sizeof(u32[2]) <= 16, "dims fit");
+	u32 dims[2] = {atlasW, atlasH};
+	std::memcpy([m_hud_dims_buffer contents], dims, sizeof(dims));
+	// Temp (region-sized pristine copy). Recreated only on a region change
+	// (fixed per run); no in-flight work references the old buffer (every
+	// call waits), so direct replacement is safe. The row pitch is 64-byte
+	// aligned (the vendor aligns transfer pitches to 32; a tight pitch
+	// wedges the blit); the kernel recomputes it from regionW, same formula.
+	const u32 tempW = static_cast<u32>(sc->regionW), tempH = static_cast<u32>(sc->regionH);
+	const u32 tempPitchB = (tempW * 4u + 63u) & ~63u;
+	if (!m_hud_temp_buffer || m_hud_temp_w != tempW || m_hud_temp_h != tempH)
+	{
+		m_hud_temp_buffer = MRCTransfer([m_dev.dev
+			newBufferWithLength:static_cast<NSUInteger>(tempPitchB) * tempH
+			                options:MTLResourceStorageModeShared]);
+		if (!m_hud_temp_buffer)
+		{
+			m_hud_failed = true;
+			return fail("temp buffer failed");
+		}
+		m_hud_temp_w = tempW;
+		m_hud_temp_h = tempH;
+	}
+	// Atlas (raw RGBA bytes, uploaded once per id/dims).
+	bool atlasUploaded = false;
+	if (!m_hud_atlas_buffer || m_hud_atlas_id != atlasId || m_hud_atlas_w != atlasW ||
+	    m_hud_atlas_h != atlasH)
+	{
+		m_hud_atlas_buffer = MRCTransfer([m_dev.dev
+			newBufferWithBytes:atlasPx
+			            length:static_cast<NSUInteger>(atlasW) * atlasH * 4
+			           options:MTLResourceStorageModeShared]);
+		if (!m_hud_atlas_buffer)
+		{
+			m_hud_failed = true;
+			return fail("atlas buffer failed");
+		}
+		m_hud_atlas_id = atlasId;
+		m_hud_atlas_w = atlasW;
+		m_hud_atlas_h = atlasH;
+		atlasUploaded = true;
+		std::fprintf(stderr, "GE1 HUD Metal composite: atlas uploaded %ux%u id=%llu\n", atlasW, atlasH,
+			static_cast<unsigned long long>(atlasId));
+	}
+	// Own command buffer on the shared queue: blit the pristine region, then
+	// the composite dispatch. No dependency on the export is needed (its
+	// completion already fired), and no later export can reuse this surface
+	// (the runtime holds the slot until this call returns).
+	id<MTLCommandBuffer> cmd = [m_queue commandBuffer];
+	if (!cmd)
+	{
+		m_hud_failed = true;
+		return fail("command buffer failed");
+	}
+	id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
+	[blit copyFromTexture:surfTex
+	            sourceSlice:0
+	            sourceLevel:0
+	           sourceOrigin:MTLOriginMake(static_cast<NSUInteger>(sc->regionX), static_cast<NSUInteger>(sc->regionY), 0)
+	             sourceSize:MTLSizeMake(tempW, tempH, 1)
+	               toBuffer:m_hud_temp_buffer
+	      destinationOffset:0
+	 destinationBytesPerRow:static_cast<NSUInteger>(tempPitchB)
+	destinationBytesPerImage:static_cast<NSUInteger>(tempPitchB) * tempH];
+	[blit endEncoding];
+	id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+	[enc setComputePipelineState:m_hud_pipeline];
+	[enc setBuffer:m_hud_scene_buffer offset:0 atIndex:0];
+	[enc setBuffer:m_hud_temp_buffer offset:0 atIndex:1];
+	[enc setBuffer:m_hud_atlas_buffer offset:0 atIndex:2];
+	[enc setBuffer:m_hud_dims_buffer offset:0 atIndex:3];
+	[enc setTexture:surfTex atIndex:0];
+	[enc dispatchThreadgroups:MTLSizeMake((tempW + 15) / 16, (tempH + 15) / 16, 1)
+	    threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+	[enc endEncoding];
+	[cmd commit];
+	[cmd waitUntilCompleted];
+	if (cmd.status != MTLCommandBufferStatusCompleted)
+	{
+		NSError* err = cmd.error;
+		std::fprintf(stderr, "GE1 HUD Metal composite: command buffer %s: %s\n",
+			cmd.status == MTLCommandBufferStatusError ? "failed" : "aborted",
+			err ? [[err localizedDescription] UTF8String] : "(no error)");
+		m_hud_failed = true;
+		return fail("composite command buffer failed");
+	}
+	*done_token = ++m_hud_done_seq;
+	if (atlasUploaded)
+		std::fprintf(stderr, "GE1 HUD Metal composite: first composite after atlas upload\n");
+	return true;
+}}
+
+bool MT_CompositeHudIOSurface(GSDevice* dev, void* iosurface, const void* scene, u32 sceneSize,
+	const u8* atlasPx, u32 atlasW, u32 atlasH, u64 atlasId, u64* done_token)
+{
+	if (!dev || dev->GetRenderAPI() != RenderAPI::Metal)
+		return false;
+	return static_cast<GSDeviceMTL*>(dev)->CompositeHudIOSurface(iosurface, scene, sceneSize, atlasPx,
+		atlasW, atlasH, atlasId, done_token);
 }
 
 bool MT_CopySnapshotToIOSurface(GSDevice* dev, GSTexture* source, void* iosurface, u32 width, u32 height,

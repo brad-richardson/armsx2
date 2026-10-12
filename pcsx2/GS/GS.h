@@ -212,6 +212,16 @@ int GSCompositeHudAHB(AHardwareBuffer* buffer, const void* scene, u32 sceneSize,
 typedef void (*GSExportIOSurfaceDoneFn)(void* ctx, int ok);
 int GSExportSnapshotToIOSurface(void* iosurface, u32 width, u32 height, GSExportIOSurfaceDoneFn done, void* ctx);
 void GSReleaseExportIOSurface(void* iosurface);
+// HUD5: composite one Tricky HUD scene onto an already-exported IOSurface, on
+// this device's Metal queue (own command buffer; synchronous: the call blocks
+// until the GPU is done). The surface must hold a completed BGRA export and
+// stay alive for the call. The scene blob is the runtime's Ge1HudScene (magic
+// + version + fixed-size geometry; re-validated here, fail-closed); the atlas
+// is w*h*4 RGBA bytes uploaded once per (id, w, h). 1=composited
+// (*done_token is a nonzero done marker), 0/-1=not composited (CPU fallback).
+#define GS_HAS_HUD_MTL_API 1
+int GSCompositeHudIOSurface(void* iosurface, const void* scene, u32 sceneSize, const u8* atlasPx,
+	u32 atlasW, u32 atlasH, u64 atlasId, u64* done_token);
 #endif
 void GSJoinSnapshotThreads();
 

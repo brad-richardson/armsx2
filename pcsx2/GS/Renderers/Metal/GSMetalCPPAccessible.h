@@ -20,6 +20,9 @@ std::vector<GSAdapterInfo> GetMetalAdapterList();
 bool MT_CopySnapshotToIOSurface(GSDevice* dev, GSTexture* source, void* iosurface, u32 width, u32 height,
 	u32 pad_x, u32 pad_y, GSExportIOSurfaceDoneFn done, void* ctx);
 void MT_ReleaseExportIOSurface(GSDevice* dev, void* iosurface);
+// HUD5: C++ bridge to GSDeviceMTL's Tricky HUD composite (GSDeviceMTL.h is ObjC++-only).
+bool MT_CompositeHudIOSurface(GSDevice* dev, void* iosurface, const void* scene, u32 sceneSize,
+	const u8* atlasPx, u32 atlasW, u32 atlasH, u64 atlasId, u64* done_token);
 // ISH1: Metal TFX pipeline record/prewarm bridge (PW1 family, mirrors the VK
 // path). The record format is the raw PipelineSelectorMTL key
 // (MT_TFXSelectorSize() bytes, PSSelector + pipeline bytes). Defined in
