@@ -961,6 +961,7 @@ public:
 	void RecordTFXPipelineCreate(u64 ns);
 	void RecordSPVCompile(u64 ns);
 	bool FlushPipelineCache();
+	void WaitForPipelineCacheWrites();
 	void SetPipelineCacheFlushDeferred(bool deferred);
 	void GetAndResetPipeStats(u64* tfx_pipelines, u64* tfx_ns, u64* spv_compiles, u64* spv_ns);
 	void SetSelectorRecordEnabled(bool enabled);

@@ -9624,6 +9624,12 @@ bool GSDeviceVK::FlushPipelineCache()
 	return g_vulkan_shader_cache ? g_vulkan_shader_cache->FlushPipelineCache() : false;
 }
 
+void GSDeviceVK::WaitForPipelineCacheWrites()
+{
+	if (g_vulkan_shader_cache)
+		g_vulkan_shader_cache->WaitForPipelineCacheWrites();
+}
+
 void GSDeviceVK::GetAndResetPipeStats(u64* tfx_pipelines, u64* tfx_ns, u64* spv_compiles, u64* spv_ns)
 {
 	const u64 got_tfx = m_tfx_pipelines_created.exchange(0, std::memory_order_relaxed);

@@ -119,6 +119,14 @@ void GSFlushPipelineCache()
 #endif
 }
 
+void GSWaitPipelineCacheWrites()
+{
+#ifdef ENABLE_VULKAN
+	if (GSDeviceVK* dev = GetVKDeviceForPW1())
+		dev->WaitForPipelineCacheWrites();
+#endif
+}
+
 void GSGetAndResetPipelineStats(u64* tfx_pipelines, u64* tfx_ns, u64* spv_compiles, u64* spv_ns)
 {
 	u64 got_tfx = 0, got_tfx_ns = 0, got_spv = 0, got_spv_ns = 0;

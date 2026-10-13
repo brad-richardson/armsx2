@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "GS/GSBackgroundWriter.h"
 #include "GS/GSCacheFile.h"
 #include "GS/Renderers/Vulkan/VKLoader.h"
 
@@ -30,9 +31,12 @@ public:
 	VkPipelineCache GetPipelineCache(bool set_dirty = true);
 
 	/// Writes pipeline cache to file, saving all newly compiled pipelines.
-	/// Serialises the pipeline cache to disk. This is SYNCHRONOUS and runs on the GS thread, so it
-	/// is rate-limited: pass force=true only where a missed flush actually loses data (teardown).
+	/// PCF2: only the snapshot (vkGetPipelineCacheData) runs on the calling thread; hashing, framing
+	/// and the file write run on m_pipeline_cache_writer. Still rate-limited: pass force=true only
+	/// where a missed flush actually loses data (teardown). Returns true if a write was queued.
 	bool FlushPipelineCache(bool force = false);
+	/// Blocks until every queued pipeline cache write has reached the file (app pause, teardown).
+	void WaitForPipelineCacheWrites() { m_pipeline_cache_writer.Drain(); }
 	void SetPipelineCacheFlushDeferred(bool deferred)
 	{
 		m_pipeline_cache_flush_deferred.store(deferred, std::memory_order_relaxed);
@@ -74,7 +78,8 @@ private:
 	std::string m_pipeline_cache_filename;
 	GSCacheFile::Stamp m_pipeline_cache_stamp;
 	/// Hash of the pipeline cache data last read or written, so an unchanged cache is not rewritten.
-	u64 m_pipeline_cache_file_hash = 0;
+	/// PCF2: written by the writer thread after a write, and by the GS thread on open/reset.
+	std::atomic<u64> m_pipeline_cache_file_hash{0};
 
 	VkPipelineCache m_pipeline_cache = VK_NULL_HANDLE;
 	std::atomic<bool> m_pipeline_cache_dirty{false};
@@ -82,6 +87,8 @@ private:
 	std::atomic<bool> m_pipeline_cache_flush_deferred{false};
 	/// When the cache was last serialised, so the synchronous GS-thread write can be rate-limited.
 	std::chrono::steady_clock::time_point m_last_pipeline_cache_flush{};
+	/// PCF2: writes snapshots off the GS thread. Last member, so it is destroyed (drained) first.
+	GSBackgroundWriter m_pipeline_cache_writer;
 };
 
 extern std::unique_ptr<VKShaderCache> g_vulkan_shader_cache;

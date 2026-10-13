@@ -104,6 +104,8 @@ namespace GSCacheFile
 	u32 PruneOtherIdentities(const std::string& dir, std::string_view prefix, std::string_view current_stem, u32 keep);
 
 	/// A whole file: header, then one payload covered by one checksum.
+	/// FrameFile returns those bytes, for a caller that writes them itself (PCF2's background writer).
+	std::vector<u8> FrameFile(Kind kind, const Stamp& stamp, const void* data, size_t size);
 	bool WriteFramedFile(const std::string& path, Kind kind, const Stamp& stamp, const void* data, size_t size);
 	ReadResult ReadFramedFile(const std::string& path, Kind kind, const Stamp& stamp, std::vector<u8>* payload);
 

@@ -420,6 +420,7 @@ VKShaderCache::~VKShaderCache()
 {
 	m_spirv_store.Close();
 	FlushPipelineCache(true); // teardown: never skip, this is the last chance to persist
+	m_pipeline_cache_writer.Drain(); // PCF2: the write must land before the process may exit
 	ClosePipelineCache();
 }
 
@@ -520,6 +521,8 @@ void VKShaderCache::ResetPipelineCache()
 {
 	// Nothing else may be using the cache: the caller has stopped the precompile workers and runs on
 	// the GS thread. Pipelines already built do not refer to it.
+	// PCF2: a snapshot of the old cache still queued would otherwise land after the reset.
+	m_pipeline_cache_writer.Drain();
 	ClosePipelineCache();
 	CreateNewPipelineCache();
 }
@@ -597,7 +600,7 @@ bool VKShaderCache::FlushPipelineCache(bool force)
 	if (m_pipeline_cache == VK_NULL_HANDLE || !m_pipeline_cache_dirty || m_pipeline_cache_filename.empty())
 		return false;
 
-	// ★ Rate-limited, because this whole function is synchronous ON THE GS THREAD: it re-serialises
+	// ★ Rate-limited. This used to be synchronous ON THE GS THREAD end to end: it re-serialises
 	// the ENTIRE cache (measured at 777 KB on a Retroid Pocket 6) and writes it to disk, and the
 	// emulator is frozen for the duration. GetTFXPipeline triggers it every 256 new compiles with
 	// no time bound, and fast-forward blasts through content at 4x+ — hitting many new pipeline
@@ -605,7 +608,8 @@ bool VKShaderCache::FlushPipelineCache(bool force)
 	// right as the user drops back to normal speed. That is the reported "turn FF off and it hangs
 	// for a few seconds", and it is intermittent precisely because it depends on whether the burst
 	// crossed the counter. Losing a flush costs nothing but recompiling those pipelines on the next
-	// cold start, so throttling is strictly a win; teardown passes force=true.
+	// cold start, so throttling is strictly a win; teardown passes force=true. PCF2 moved the hash
+	// and the write to a background thread; the throttle still bounds the snapshot copies.
 	static constexpr std::chrono::seconds MIN_FLUSH_INTERVAL{120};
 	const auto now = std::chrono::steady_clock::now();
 	if (!force && m_last_pipeline_cache_flush.time_since_epoch().count() != 0 &&
@@ -621,6 +625,11 @@ bool VKShaderCache::FlushPipelineCache(bool force)
 	// again instead of being lost.
 	m_pipeline_cache_dirty.store(false, std::memory_order_relaxed);
 
+	// PCF2: the snapshot stays on this thread. vkGetPipelineCacheData does not require external
+	// synchronisation of pipelineCache (only vkMergePipelineCaches' dstCache and
+	// vkDestroyPipelineCache do, and creation-time VK_PIPELINE_CACHE_CREATE_EXTERNALLY_SYNCHRONIZED_BIT
+	// is not set, so compile workers may use it concurrently). Taking it here, the thread that
+	// destroys the cache, keeps the handle alive for the whole call; the writer only gets bytes.
 	size_t data_size;
 	VkResult res =
 		vkGetPipelineCacheData(GSDeviceVK::GetInstance()->GetDevice(), m_pipeline_cache, &data_size, nullptr);
@@ -642,25 +651,33 @@ bool VKShaderCache::FlushPipelineCache(bool force)
 
 	data.resize(data_size);
 
-	// Compared by content: a blob can change without changing size.
-	const u64 hash = GSCacheFile::Hash64(data.data(), data.size());
-	if (hash == m_pipeline_cache_file_hash)
-	{
-		Console.WriteLn("Skipping updating pipeline cache '%s' due to no changes.", m_pipeline_cache_filename.c_str());
-		return true;
-	}
+	// A newer snapshot replaces one still queued; at most one write is in flight.
+	m_pipeline_cache_writer.Submit(m_pipeline_cache_filename,
+		[this, data = std::move(data), filename = m_pipeline_cache_filename, stamp = m_pipeline_cache_stamp]() {
+			// Compared by content: a blob can change without changing size.
+			const u64 hash = GSCacheFile::Hash64(data.data(), data.size());
+			if (hash == m_pipeline_cache_file_hash.load(std::memory_order_relaxed))
+			{
+				Console.WriteLn("Skipping updating pipeline cache '%s' due to no changes.", filename.c_str());
+				return;
+			}
 
-	// Framed with a checksum and written to a temporary file that is renamed over the old one: a
-	// half-written blob that still passes the driver's header check has rendered garbage on Adreno.
-	Console.WriteLn("Writing %zu bytes to '%s'", data_size, m_pipeline_cache_filename.c_str());
-	if (!GSCacheFile::WriteFramedFile(m_pipeline_cache_filename, GSCacheFile::KIND_VK_PIPELINES,
-			m_pipeline_cache_stamp, data.data(), data.size()))
-	{
-		Console.Error("Failed to write pipeline cache to '%s'", m_pipeline_cache_filename.c_str());
-		m_pipeline_cache_dirty.store(true, std::memory_order_relaxed);
-		return false;
-	}
-	m_pipeline_cache_file_hash = hash;
+			// Framed with a checksum, written to a temporary file, fsynced and renamed over the old one:
+			// a half-written blob that still passes the driver's header check has rendered garbage on Adreno.
+			const auto t0 = std::chrono::steady_clock::now();
+			const std::vector<u8> framed =
+				GSCacheFile::FrameFile(GSCacheFile::KIND_VK_PIPELINES, stamp, data.data(), data.size());
+			if (!GSBackgroundWriter::WriteFileDurable(filename, framed.data(), framed.size()))
+			{
+				Console.Error("Failed to write pipeline cache to '%s'", filename.c_str());
+				m_pipeline_cache_dirty.store(true, std::memory_order_relaxed);
+				return;
+			}
+			m_pipeline_cache_file_hash.store(hash, std::memory_order_relaxed);
+			Console.WriteLn("Writing %zu bytes to '%s' (PCF2 background, %lld us)", data.size(), filename.c_str(),
+				static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(
+					std::chrono::steady_clock::now() - t0).count()));
+		});
 	return true;
 }
 

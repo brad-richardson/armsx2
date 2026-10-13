@@ -276,13 +276,19 @@ namespace GSCacheFile
 		return true;
 	}
 
-	bool WriteFramedFile(const std::string& path, Kind kind, const Stamp& stamp, const void* data, size_t size)
+	std::vector<u8> FrameFile(Kind kind, const Stamp& stamp, const void* data, size_t size)
 	{
 		const FileHeader h = MakeHeader(FRAMED_MAGIC, kind, 0, stamp.GetDigest(), size, Hash64(data, size));
 		std::vector<u8> out(sizeof(h) + size);
 		std::memcpy(out.data(), &h, sizeof(h));
 		if (size > 0)
 			std::memcpy(out.data() + sizeof(h), data, size);
+		return out;
+	}
+
+	bool WriteFramedFile(const std::string& path, Kind kind, const Stamp& stamp, const void* data, size_t size)
+	{
+		const std::vector<u8> out = FrameFile(kind, stamp, data, size);
 		return WriteFileAtomic(path, out.data(), out.size());
 	}
 
