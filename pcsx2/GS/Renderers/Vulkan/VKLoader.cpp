@@ -254,7 +254,14 @@ static bool Ge1LoadTurnipHAL(Error* error)
 	s_turnip_hal_device = static_cast<Ge1HalDevice*>(device);
 	vkGetInstanceProcAddr = s_turnip_hal_device->getInstanceProcAddr;
 	if (!vkGetInstanceProcAddr)
+	{
+		std::fprintf(stderr, "GE1 Turnip: missing instance proc address\n");
+		s_turnip_hal_device->close(s_turnip_hal_device);
+		s_turnip_hal_device = nullptr;
+		Vulkan::ResetVulkanLibraryFunctionPointers();
+		s_vulkan_library.Close();
 		return false;
+	}
 	bool missing = false;
 #define GE1_TURNIP_MODULE(name, required) \
 	name = reinterpret_cast<PFN_##name>(vkGetInstanceProcAddr(VK_NULL_HANDLE, #name)); \
@@ -267,6 +274,7 @@ static bool Ge1LoadTurnipHAL(Error* error)
 	vkDestroyInstance = &Ge1TurnipDestroyInstance;
 	if (missing)
 	{
+		s_turnip_hal_device->close(s_turnip_hal_device);
 		Vulkan::ResetVulkanLibraryFunctionPointers();
 		s_vulkan_library.Close();
 		s_turnip_hal_device = nullptr;
@@ -288,7 +296,13 @@ bool Vulkan::LoadVulkanLibrary(Error* error)
 
 #if defined(__ANDROID__)
 	if (const char* turnip = std::getenv("GE1_VK_TURNIP"); turnip && std::strcmp(turnip, "1") == 0)
-		return Ge1LoadTurnipHAL(error);
+	{
+		if (Ge1LoadTurnipHAL(error))
+			return true;
+		std::fprintf(stderr, "GE1 Turnip: load failed, falling back to system Vulkan\n");
+		setenv("GE1_VK_TURNIP", "0", 1);
+		Error::Clear(error);
+	}
 #endif
 
 #ifdef __APPLE__
