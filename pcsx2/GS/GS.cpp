@@ -26,6 +26,7 @@
 #include "GS/Renderers/HW/GSHwHack.h"
 #include "GS/Renderers/HW/GSDrawLog.h"
 #include "GS/Renderers/HW/GSTextureReplacements.h"
+#include "GS/Renderers/HW/GSTextureOnDeviceUpscale.h"
 #include "VMManager.h"
 
 #ifdef ENABLE_OPENGL
@@ -1415,7 +1416,16 @@ void GSUpdateConfig(const Pcsx2Config::GSOptions& new_config)
 	// clear the hash texture cache since we might have replacements now
 	// also clear it when dumping changes, since we want to dump everything being used
 	// and when upscaling changes, so textures revert to native or are upscaled with the new mode
-	// (REM3 P10: same for the on-device toggle — purge re-resolves without a reboot)
+	// (REM3 P11b: the ordered live-toggle command. GSUpdateConfig runs
+	// on the host GS worker (MTGS::ApplySettings posts it there FIFO, so
+	// prior packets drain first); applying the vendor flag here before the
+	// purge makes the re-resolve observe the new state with no reboot.
+	// Fonts are sync-only, so no in-flight async work can outlive the purge.)
+	if (GSConfig.OnDeviceUpscale != old_config.OnDeviceUpscale)
+	{
+		static unsigned s_odu_seq = 0;
+		GE1OnDeviceUpscale::ApplyOnDeviceUpscale(GSConfig.OnDeviceUpscale != 0, ++s_odu_seq);
+	}
 	if (GSConfig.LoadTextureReplacements != old_config.LoadTextureReplacements ||
 		GSConfig.DumpReplaceableTextures != old_config.DumpReplaceableTextures ||
 		GSConfig.TextureUpscale != old_config.TextureUpscale ||
