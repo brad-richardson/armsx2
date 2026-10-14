@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <set>
 #include <cstdlib>
 #include <cstring>
 
@@ -60,6 +61,15 @@ Stats s_stats;
 int SfnIndex(int atlas)
 {
 	return atlas == 2 ? 0 : (atlas == 72 ? 1 : -1);
+}
+
+// Boot-log diagnostics: first occurrence per key (rare paths only; the
+// hot miss path stays quiet).
+std::set<std::string> s_logged;
+void LogOnceLocked(const std::string& key, const std::string& msg)
+{
+	if (s_logged.insert(key).second)
+		Console.WriteLn("ODU: %s", msg.c_str());
 }
 
 std::string Hex8(std::uint64_t v)
@@ -280,10 +290,12 @@ bool LookupGenerated(const GSTextureCache::HashCacheKey& key, const GIFRegTEX0& 
 		s_stats.skipped_gpu_clut++;
 		return false;
 	}
+	// Suffix bits use the key's masked TEXA (zero for paletted formats),
+	// exactly like CreateTextureName — never the raw guest TEXA.
 	const std::uint32_t suffix = static_cast<std::uint32_t>(TEX0.PSM) |
 		(static_cast<std::uint32_t>(TEX0.TW) << 6) | (static_cast<std::uint32_t>(TEX0.TH) << 10) |
-		(static_cast<std::uint32_t>(TEXA.TA0) << 15) | (static_cast<std::uint32_t>(TEXA.AEM) << 23) |
-		(static_cast<std::uint32_t>(TEXA.TA1) << 24);
+		(static_cast<std::uint32_t>(key.TEXA.TA0) << 15) | (static_cast<std::uint32_t>(key.TEXA.AEM) << 23) |
+		(static_cast<std::uint32_t>(key.TEXA.TA1) << 24);
 	const RegistryRow* row = nullptr;
 	for (const RegistryRow& r : kRegistry)
 	{
@@ -296,6 +308,13 @@ bool LookupGenerated(const GSTextureCache::HashCacheKey& key, const GIFRegTEX0& 
 	if (!row)
 		return false;
 	s_stats.registry_hits++;
+	{
+		char msg[160];
+		std::snprintf(msg, sizeof(msg), "registry hit atlas %d (tex0=%s clut=%s suffix=%s).",
+			row->atlas, Hex16(row->tex0hash).c_str(), Hex16(row->cluthash).c_str(),
+			Hex8(row->suffix).c_str());
+		LogOnceLocked("hit-" + std::to_string(row->atlas), msg);
+	}
 	const SfnStore* sfn = nullptr;
 	std::string sfn_digest = "words-v1";
 	if (row->sfn_file)
