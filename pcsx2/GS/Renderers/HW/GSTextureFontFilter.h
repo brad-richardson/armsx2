@@ -60,9 +60,6 @@ bool BuildFontAtlas(int atlas, const std::uint8_t* stock_rgba, int w, int h,
 // Hash filenames of the four stock atlases (mirrors remaster_font.NAMES).
 const char* DumpFilename(int atlas);
 
-// Temporary parity-debug entry (removed before landing).
-void DebugEdge8(const float* a, int w, int h, std::uint8_t* out);
-
 // PNG writer replicating the oracle's Pillow 12.3 ZipEncode (filter order
 // None->Up->Sub->Paeth, wrapped-byte SAD, deflate 6/15/9/Z_FILTERED, one
 // row per call, 64 KiB IDAT splits, no ancillary chunks). Byte-equal to

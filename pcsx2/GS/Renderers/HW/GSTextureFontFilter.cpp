@@ -522,11 +522,6 @@ void EmitChunk(std::vector<std::uint8_t>& out, const char* type, const std::uint
 
 } // namespace
 
-void DebugEdge8(const float* a, int w, int h, std::uint8_t* out)
-{
-	UpsampleEdge8(a, w, h, out);
-}
-
 bool WriteFontPNG(const std::string& path, const std::uint8_t* rgba, int w, int h)
 {
 	const size_t stride = static_cast<size_t>(w) * 4;
