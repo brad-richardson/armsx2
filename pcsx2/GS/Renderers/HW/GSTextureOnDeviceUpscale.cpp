@@ -295,20 +295,15 @@ bool LookupGenerated(const GSTextureCache::HashCacheKey& key, const GIFRegTEX0& 
 			LogOnceLocked("skip-fmv", "skip: FMVstarted set.");
 		return false;
 	}
-	if (mipmap || key.region_width != 0 || key.region_height != 0)
+	// LOD ranges are served from the generated base exactly like a pack
+	// texture without mip files (the device regenerates mips when asked).
+	// Only sub-region lookups stay stock; the registry rows are full-texture.
+	(void)mipmap;
+	if (key.region_width != 0 || key.region_height != 0)
 	{
-		if (mipmap)
-		{
-			s_stats.skipped_mipmap++;
-			if (s_trace)
-				LogOnceLocked("skip-mipmap", "skip: lod mipmap range set.");
-		}
-		else
-		{
-			s_stats.skipped_region++;
-			if (s_trace)
-				LogOnceLocked("skip-region", "skip: sub-region lookup.");
-		}
+		s_stats.skipped_region++;
+		if (s_trace)
+			LogOnceLocked("skip-region", "skip: sub-region lookup.");
 		return false;
 	}
 	// Same guard as the generic upscaler: the CPU CLUT copy must be live.
