@@ -51,6 +51,7 @@ struct SfnStore
 
 std::mutex s_lock;
 bool s_initialized = false;
+bool s_trace = false; // TEMPORARY P10 bring-up: GE1_ODU_TRACE=1. Removed before landing.
 bool s_enabled = false;
 unsigned s_generation = 0;
 unsigned s_applied_seq = 0;
@@ -184,6 +185,8 @@ void InitializeFromEnvironment()
 	s_initialized = true;
 	const char* e = std::getenv("GE1_ONDEVICE_UPSCALE");
 	s_enabled = (e && std::strcmp(e, "1") == 0);
+	const char* t = std::getenv("GE1_ODU_TRACE");
+	s_trace = (t && std::strcmp(t, "1") == 0);
 	if (s_enabled)
 		s_generation = 1;
 	const char* sfn_dir = std::getenv("GE1_ONDEVICE_SFN_DIR");
@@ -304,6 +307,13 @@ bool LookupGenerated(const GSTextureCache::HashCacheKey& key, const GIFRegTEX0& 
 			row = &r;
 			break;
 		}
+	}
+	if (s_trace)
+	{
+		Console.WriteLn("ODU: lookup tex0=%s clut=%s suffix=%08x region=%ux%u mipmap=%d match=%s.",
+			Hex16(key.TEX0Hash).c_str(), Hex16(key.CLUTHash).c_str(), suffix,
+			static_cast<unsigned>(key.region_width), static_cast<unsigned>(key.region_height),
+			mipmap ? 1 : 0, row ? "yes" : "no");
 	}
 	if (!row)
 		return false;
