@@ -1415,9 +1415,11 @@ void GSUpdateConfig(const Pcsx2Config::GSOptions& new_config)
 	// clear the hash texture cache since we might have replacements now
 	// also clear it when dumping changes, since we want to dump everything being used
 	// and when upscaling changes, so textures revert to native or are upscaled with the new mode
+	// (REM3 P10: same for the on-device toggle — purge re-resolves without a reboot)
 	if (GSConfig.LoadTextureReplacements != old_config.LoadTextureReplacements ||
 		GSConfig.DumpReplaceableTextures != old_config.DumpReplaceableTextures ||
-		GSConfig.TextureUpscale != old_config.TextureUpscale)
+		GSConfig.TextureUpscale != old_config.TextureUpscale ||
+		GSConfig.OnDeviceUpscale != old_config.OnDeviceUpscale)
 	{
 		g_gs_renderer->PurgeTextureCache(true, false, true);
 	}

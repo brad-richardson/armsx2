@@ -94,6 +94,14 @@ namespace GSTextureReplacements
 	/// nothing could be queued.
 	GSTexture* LookupUpscaledTexture(const UpscaleRequest& request, GSLocalMemory& mem, bool* pending, std::pair<u8, u8>* alpha_minmax);
 
+	/// Decodes one guest level to RGBA8 and hands the pixels to `consume` while the owned
+	/// buffer is alive (same block-aligned read as DumpTexture/ReadUpscaleSourceLevel, without
+	/// depending on dump enablement, filenames or disk). Returns false without calling
+	/// `consume` when the level is unreadable; otherwise returns what `consume` returns.
+	bool WithDecodedSourceLevel(const GIFRegTEX0& TEX0, const GIFRegTEXA& TEXA,
+		const GSTextureCache::SourceRegion& region, GSLocalMemory& mem,
+		std::function<bool(const u8* pixels, u32 width, u32 height, u32 pitch)> consume);
+
 	struct UpscaleStats
 	{
 		u64 queued;

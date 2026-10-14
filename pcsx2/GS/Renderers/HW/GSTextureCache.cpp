@@ -3,6 +3,7 @@
 
 #include "GSTextureCache.h"
 #include "GSTextureReplacements.h"
+#include "GS/Renderers/HW/GSTextureOnDeviceUpscale.h"
 #include "GSRendererHW.h"
 #include "GS/GSState.h"
 #include "GS/GSGL.h"
@@ -7590,8 +7591,11 @@ GSTextureCache::HashCacheEntry* GSTextureCache::LookupHashCache(const GIFRegTEX0
 	const bool upscale = GSTextureReplacements::IsUpscaleActive() && !FMVstarted &&
 	                     !(clut && g_gs_renderer->m_mem.m_clut.GetGPUTexture()) &&
 	                     GSTextureReplacements::CanUpscaleTexture(tw, th);
+	// On-device generated replacements have their own enable predicate; the registry match
+	// itself happens post-hash on the miss path below.
+	const bool ondevice = GE1OnDeviceUpscale::IsEnabled();
 	bool can_cache = (TEX0.PSM >= PSMT8H && TEX0.PSM <= PSMT4HH) ? CanPreloadTextureSize(TEX0.TW, TEX0.TH) : CanCacheTextureSize(TEX0.TW, TEX0.TH);
-	if (!dump && !replace && !upscale && !can_cache)
+	if (!dump && !replace && !upscale && !ondevice && !can_cache)
 		return nullptr;
 
 	// need the hash either for replacing, dumping or caching.
@@ -7673,6 +7677,28 @@ GSTextureCache::HashCacheEntry* GSTextureCache::LookupHashCache(const GIFRegTEX0
 			// If the hash cache is disabled, this will be false, and we need to force it to be cached,
 			// so that when the replacement comes back, there's something for it to swap with.
 			can_cache = true;
+		}
+	}
+
+	// On-device generated replacements (REM3 P10): the targeted registry runs after pack
+	// precedence on the same miss. Sync only: a ready result inserts like a pack texture,
+	// anything else falls through to stock (or the generic upscaler below).
+	if (!replacement_texture_pending)
+	{
+		GSTextureReplacements::ReplacementTexture generated_tex;
+		std::pair<u8, u8> generated_minmax;
+		if (GE1OnDeviceUpscale::LookupGenerated(key, TEX0, TEXA, region, g_gs_renderer->m_mem,
+				lod != nullptr, generated_tex, &generated_minmax))
+		{
+			GSTexture* gen_tex = GSTextureReplacements::CreateReplacementTexture(generated_tex, lod != nullptr);
+			if (gen_tex)
+			{
+				// Same shape as a found pack texture: not indexed, so paltex goes.
+				paltex = false;
+				const HashCacheEntry entry{gen_tex, 1u, 0u, generated_minmax, true, true};
+				m_hash_cache_replacement_memory_usage += entry.texture->GetMemUsage();
+				return &m_hash_cache.emplace(key, entry).first->second;
+			}
 		}
 	}
 

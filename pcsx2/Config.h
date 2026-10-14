@@ -985,6 +985,12 @@ struct Pcsx2Config
 					LoadTextureReplacements : 1,
 					LoadTextureReplacementsAsync : 1,
 					PrecacheTextureReplacements : 1,
+					/// REM3 P10: on-device generated replacements (registry +
+					/// font recipe). Live toggle, not restart: covered by
+					/// OptionsAreEqual via the bitsets above. Session state;
+					/// the env default comes from GE1_ONDEVICE_UPSCALE at open
+					/// (Phase 2's settings command drives it live).
+					OnDeviceUpscale : 1,
 					OrganizeSnapshotsByGame : 1;
 			};
 		};

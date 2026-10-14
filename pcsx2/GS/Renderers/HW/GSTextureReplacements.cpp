@@ -1592,6 +1592,37 @@ bool GSTextureReplacements::ReadUpscaleSourceLevel(const GIFRegTEX0& TEX0, const
 	return true;
 }
 
+bool GSTextureReplacements::WithDecodedSourceLevel(const GIFRegTEX0& TEX0, const GIFRegTEXA& TEXA,
+	const GSTextureCache::SourceRegion& region, GSLocalMemory& mem,
+	std::function<bool(const u8* pixels, u32 width, u32 height, u32 pitch)> consume)
+{
+	// Same read as DumpTexture and ReadUpscaleSourceLevel above: the block
+	// aligned rect, then the offset of the region inside it.
+	const GSLocalMemory::psm_t& psm = GSLocalMemory::m_psm[TEX0.PSM];
+	const GSVector2i& bs = psm.bs;
+	const int tw = region.HasX() ? region.GetWidth() : (1 << TEX0.TW);
+	const int th = region.HasY() ? region.GetHeight() : (1 << TEX0.TH);
+	if (tw <= 0 || th <= 0)
+		return false;
+
+	const GSVector4i rect(region.GetRect(tw, th));
+	const GSVector4i block_rect(rect.ralign<Align_Outside>(bs));
+	const u32 pitch = static_cast<u32>(block_rect.width()) * sizeof(u32);
+
+	// ReadTexture() wants 32 byte alignment.
+	u8* buffer = static_cast<u8*>(_aligned_malloc(static_cast<size_t>(pitch) * static_cast<u32>(block_rect.height()), 32));
+	if (!buffer)
+		return false;
+
+	psm.rtx(mem, mem.GetOffset(TEX0.TBP0, TEX0.TBW, TEX0.PSM), block_rect, buffer, pitch, TEXA);
+
+	const u8* pixels = buffer + (static_cast<u32>(rect.top - block_rect.top) * pitch) +
+	                   (static_cast<u32>(rect.left - block_rect.left) * sizeof(u32));
+	const bool result = consume(pixels, static_cast<u32>(tw), static_cast<u32>(th), pitch);
+	_aligned_free(buffer);
+	return result;
+}
+
 GSTexture* GSTextureReplacements::LookupUpscaledTexture(const UpscaleRequest& request, GSLocalMemory& mem,
 	bool* pending, std::pair<u8, u8>* alpha_minmax)
 {
