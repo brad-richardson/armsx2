@@ -50,6 +50,7 @@ struct SfnStore
 };
 
 std::mutex s_lock;
+std::once_flag s_init_once;
 bool s_initialized = false;
 bool s_trace = false; // TEMPORARY P10 bring-up: GE1_ODU_TRACE=1. Removed before landing.
 bool s_enabled = false;
@@ -177,6 +178,11 @@ std::string CacheKey(const RegistryRow& row, const std::string& sfn_digest)
 
 } // namespace
 
+void EnsureInitialized()
+{
+	std::call_once(s_init_once, InitializeFromEnvironment);
+}
+
 void InitializeFromEnvironment()
 {
 	std::unique_lock<std::mutex> lock(s_lock);
@@ -226,6 +232,9 @@ void ApplyOnDeviceUpscale(bool enabled, unsigned sequence)
 
 bool IsEnabled()
 {
+	// The lookup gate asks before any miss runs: initialize here so the
+	// open-time environment is honored on the very first lookup.
+	EnsureInitialized();
 	std::unique_lock<std::mutex> lock(s_lock);
 	return s_enabled;
 }
@@ -264,8 +273,7 @@ bool LookupGenerated(const GSTextureCache::HashCacheKey& key, const GIFRegTEX0& 
 	const GIFRegTEXA& TEXA, GSTextureCache::SourceRegion region, GSLocalMemory& mem, bool mipmap,
 	GSTextureReplacements::ReplacementTexture& out, std::pair<std::uint8_t, std::uint8_t>* alpha_minmax)
 {
-	static std::once_flag init_once;
-	std::call_once(init_once, InitializeFromEnvironment);
+	EnsureInitialized();
 
 	std::unique_lock<std::mutex> lock(s_lock);
 	s_stats.lookups++;
