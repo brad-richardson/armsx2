@@ -11,7 +11,6 @@
 
 #include <algorithm>
 #include <cstdio>
-#include <set>
 #include <cstdlib>
 #include <cstring>
 
@@ -40,7 +39,7 @@ constexpr RegistryRow kRegistry[] = {
 	{0x51446d7052987c01ULL, 0xe5708d0189ccd302ULL, 0x0000221b, 70, 256, 256, nullptr},
 	{0xfb36e14323437580ULL, 0x2f302f4bc33356f5ULL, 0x0000221b, 80, 256, 256, nullptr},
 };
-constexpr char kRecipe[] = "raster-edge:v1";
+constexpr char kRecipe[] = "raster-edge-v1";
 
 struct SfnStore
 {
@@ -52,7 +51,6 @@ struct SfnStore
 std::mutex s_lock;
 std::once_flag s_init_once;
 bool s_initialized = false;
-bool s_trace = false; // TEMPORARY P10 bring-up: GE1_ODU_TRACE=1. Removed before landing.
 bool s_enabled = false;
 unsigned s_generation = 0;
 unsigned s_applied_seq = 0;
@@ -63,15 +61,6 @@ Stats s_stats;
 int SfnIndex(int atlas)
 {
 	return atlas == 2 ? 0 : (atlas == 72 ? 1 : -1);
-}
-
-// Boot-log diagnostics: first occurrence per key (rare paths only; the
-// hot miss path stays quiet).
-std::set<std::string> s_logged;
-void LogOnceLocked(const std::string& key, const std::string& msg)
-{
-	if (s_logged.insert(key).second)
-		Console.WriteLn("ODU: %s", msg.c_str());
 }
 
 std::string Hex8(std::uint64_t v)
@@ -191,8 +180,6 @@ void InitializeFromEnvironment()
 	s_initialized = true;
 	const char* e = std::getenv("GE1_ONDEVICE_UPSCALE");
 	s_enabled = (e && std::strcmp(e, "1") == 0);
-	const char* t = std::getenv("GE1_ODU_TRACE");
-	s_trace = (t && std::strcmp(t, "1") == 0);
 	if (s_enabled)
 		s_generation = 1;
 	const char* sfn_dir = std::getenv("GE1_ONDEVICE_SFN_DIR");
@@ -277,12 +264,6 @@ bool LookupGenerated(const GSTextureCache::HashCacheKey& key, const GIFRegTEX0& 
 
 	std::unique_lock<std::mutex> lock(s_lock);
 	s_stats.lookups++;
-	if (s_trace && (s_stats.lookups & 1023) == 1)
-	{
-		char msg[96];
-		std::snprintf(msg, sizeof(msg), "lookups=%llu.", s_stats.lookups);
-		LogOnceLocked("look-" + std::to_string(s_stats.lookups), std::string("lookup #") + msg);
-	}
 	if (!s_enabled)
 	{
 		s_stats.skipped_disabled++;
@@ -291,8 +272,6 @@ bool LookupGenerated(const GSTextureCache::HashCacheKey& key, const GIFRegTEX0& 
 	if (FMVstarted)
 	{
 		s_stats.skipped_fmv++;
-		if (s_trace)
-			LogOnceLocked("skip-fmv", "skip: FMVstarted set.");
 		return false;
 	}
 	// LOD ranges are served from the generated base exactly like a pack
@@ -302,16 +281,12 @@ bool LookupGenerated(const GSTextureCache::HashCacheKey& key, const GIFRegTEX0& 
 	if (key.region_width != 0 || key.region_height != 0)
 	{
 		s_stats.skipped_region++;
-		if (s_trace)
-			LogOnceLocked("skip-region", "skip: sub-region lookup.");
 		return false;
 	}
 	// Same guard as the generic upscaler: the CPU CLUT copy must be live.
 	if (GSLocalMemory::m_psm[TEX0.PSM].pal > 0 && mem.m_clut.GetGPUTexture())
 	{
 		s_stats.skipped_gpu_clut++;
-		if (s_trace)
-			LogOnceLocked("skip-gpuclut", "skip: GPU CLUT texture live.");
 		return false;
 	}
 	// Suffix bits use the key's masked TEXA (zero for paletted formats),
@@ -329,23 +304,12 @@ bool LookupGenerated(const GSTextureCache::HashCacheKey& key, const GIFRegTEX0& 
 			break;
 		}
 	}
-	if (s_trace)
-	{
-		Console.WriteLn("ODU: lookup tex0=%s clut=%s suffix=%08x region=%ux%u mipmap=%d match=%s.",
-			Hex16(key.TEX0Hash).c_str(), Hex16(key.CLUTHash).c_str(), suffix,
-			static_cast<unsigned>(key.region_width), static_cast<unsigned>(key.region_height),
-			mipmap ? 1 : 0, row ? "yes" : "no");
-	}
 	if (!row)
 		return false;
 	s_stats.registry_hits++;
-	{
-		char msg[160];
-		std::snprintf(msg, sizeof(msg), "registry hit atlas %d (tex0=%s clut=%s suffix=%s).",
-			row->atlas, Hex16(row->tex0hash).c_str(), Hex16(row->cluthash).c_str(),
-			Hex8(row->suffix).c_str());
-		LogOnceLocked("hit-" + std::to_string(row->atlas), msg);
-	}
+	Console.WriteLn("ODU: registry hit atlas %d (tex0=%s clut=%s suffix=%s).",
+		row->atlas, Hex16(row->tex0hash).c_str(), Hex16(row->cluthash).c_str(),
+		Hex8(row->suffix).c_str());
 	const SfnStore* sfn = nullptr;
 	std::string sfn_digest = "words-v1";
 	if (row->sfn_file)
