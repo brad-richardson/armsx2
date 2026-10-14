@@ -6,6 +6,7 @@
 #include "common/Error.h"
 #include "common/FileSystem.h"
 #include "common/Path.h"
+#include "common/SHA256.h"
 #include "pcsx2/Config.h"
 
 #include <algorithm>
@@ -43,7 +44,7 @@ constexpr char kRecipe[] = "raster-edge:v1";
 struct SfnStore
 {
 	bool present = false;
-	std::string digest8 = "missing";
+	std::string digest16 = "missing";
 	std::vector<GE1FontFilter::SfnRow> rows;
 };
 
@@ -59,17 +60,6 @@ Stats s_stats;
 int SfnIndex(int atlas)
 {
 	return atlas == 2 ? 0 : (atlas == 72 ? 1 : -1);
-}
-
-std::uint64_t Fnv1a64(const std::uint8_t* data, std::size_t len)
-{
-	std::uint64_t h = 0xcbf29ce484222325ULL;
-	for (std::size_t i = 0; i < len; i++)
-	{
-		h ^= data[i];
-		h *= 0x100000001b3ULL;
-	}
-	return h;
 }
 
 std::string Hex8(std::uint64_t v)
@@ -90,7 +80,21 @@ std::string CacheRootLocked()
 {
 	if (!s_cache_root_override.empty())
 		return s_cache_root_override;
-	return Path::Combine(Path::Combine(EmuFolders::Cache, "ondevice-upscale"), "v1");
+	// EmuFolders::Cache is only populated through the settings UI path,
+	// which GE1 never runs; fall back to the platform data root, else run
+	// uncached (generate every time — correct, just slower).
+	std::string base = EmuFolders::Cache;
+	if (base.empty())
+	{
+		const char* d = std::getenv("GE1_GS_DATA_DIR");
+		if (d && *d)
+			base = d;
+	}
+	if (base.empty())
+		base = EmuFolders::DataRoot;
+	if (base.empty())
+		return std::string();
+	return Path::Combine(Path::Combine(base, "ondevice-upscale"), "v1");
 }
 
 bool ReadFile(const std::string& path, std::vector<std::uint8_t>& out)
@@ -229,7 +233,7 @@ bool SetSfnData(int atlas, const std::uint8_t* data, std::size_t len)
 		return false;
 	std::unique_lock<std::mutex> lock(s_lock);
 	s_sfn[idx].present = true;
-	s_sfn[idx].digest8 = Hex8(Fnv1a64(data, len));
+	s_sfn[idx].digest16 = SHA256Digest::HashHex(data, len).substr(0, 16);
 	s_sfn[idx].rows = std::move(rows);
 	return true;
 }
@@ -303,22 +307,24 @@ bool LookupGenerated(const GSTextureCache::HashCacheKey& key, const GIFRegTEX0& 
 			return false;
 		}
 		sfn = &s_sfn[idx];
-		sfn_digest = sfn->digest8;
+		sfn_digest = sfn->digest16;
 	}
-	const std::string dir = Path::Combine(Path::Combine(CacheRootLocked(), sfn_digest), kRecipe);
+	const std::string root = CacheRootLocked();
+	const bool cache_on = !root.empty();
+	const std::string dir = cache_on ? Path::Combine(Path::Combine(root, sfn_digest), kRecipe) : std::string();
 	const std::string ckey = CacheKey(*row, sfn_digest);
-	const std::string png_path = Path::Combine(dir, ckey + ".png");
-	const std::string man_path = Path::Combine(dir, ckey + ".manifest");
+	const std::string png_path = cache_on ? Path::Combine(dir, ckey + ".png") : std::string();
+	const std::string man_path = cache_on ? Path::Combine(dir, ckey + ".manifest") : std::string();
 	lock.unlock();
 
 	// Warm path: validated disk cache first (no recomputation, no reboot).
-	if (FileSystem::FileExists(png_path.c_str()) && FileSystem::FileExists(man_path.c_str()))
+	if (cache_on && FileSystem::FileExists(png_path.c_str()) && FileSystem::FileExists(man_path.c_str()))
 	{
 		GSTextureReplacements::ReplacementTextureLoader loader =
 			GSTextureReplacements::GetLoader(png_path);
 		GSTextureReplacements::ReplacementTexture cached;
-		if (loader && loader(png_path, &cached, true) && cached.width == row->expect_w * 4 &&
-			cached.height == row->expect_h * 4 && !cached.data.empty())
+		if (loader && loader(png_path, &cached, true) && cached.format == GSTexture::Format::Color &&
+			cached.width == row->expect_w * 4 && cached.height == row->expect_h * 4 && !cached.data.empty())
 		{
 			// Alpha bounds from the actual pixels (same policy as packs).
 			unsigned lo = 255, hi = 0;
@@ -395,25 +401,31 @@ bool LookupGenerated(const GSTextureCache::HashCacheKey& key, const GIFRegTEX0& 
 	}
 
 	// Persist privately (temp + rename, manifest last); loss is normal.
-	Error err;
-	FileSystem::CreateDirectoryPath(dir.c_str(), true, &err);
-	const std::string tmp_png = png_path + ".tmp";
-	if (GE1FontFilter::WriteFontPNG(tmp_png, out_rgba.data(), ow, oh) &&
-		FileSystem::RenamePath(tmp_png.c_str(), png_path.c_str(), nullptr))
+	// Written with the platform zlib: decode-equal to the oracle's PNGs
+	// everywhere, byte-equal where the compressor matches (Mac harness
+	// proves byte-equality against zlib-ng 1.3.1).
+	if (cache_on)
 	{
-		char man[256];
-		std::snprintf(man, sizeof(man),
-			"ondevice-upscale-manifest-v1\nrecipe=%s sharp=1.0 thresh=64 mode=smoothstep\n"
-			"tex0=%s clut=%s suffix=%s\nsfn=%s\ndims=%ux%u\n",
-			kRecipe, Hex16(row->tex0hash).c_str(), Hex16(row->cluthash).c_str(),
-			Hex8(row->suffix).c_str(), sfn_digest.c_str(), static_cast<unsigned>(ow),
-			static_cast<unsigned>(oh));
-		const std::string tmp_man = man_path + ".tmp";
-		WriteFileAtomic(tmp_man, reinterpret_cast<const std::uint8_t*>(man), std::strlen(man));
-		FileSystem::RenamePath(tmp_man.c_str(), man_path.c_str(), nullptr);
-		lock.lock();
-		TrimCacheLocked(dir);
-		lock.unlock();
+		Error err;
+		FileSystem::CreateDirectoryPath(dir.c_str(), true, &err);
+		const std::string tmp_png = png_path + ".tmp";
+		if (GE1FontFilter::WriteFontPNG(tmp_png, out_rgba.data(), ow, oh) &&
+			FileSystem::RenamePath(tmp_png.c_str(), png_path.c_str(), nullptr))
+		{
+			char man[256];
+			std::snprintf(man, sizeof(man),
+				"ondevice-upscale-manifest-v1\nrecipe=%s sharp=1.0 thresh=64 mode=smoothstep\n"
+				"tex0=%s clut=%s suffix=%s\nsfn=%s\ndims=%ux%u\n",
+				kRecipe, Hex16(row->tex0hash).c_str(), Hex16(row->cluthash).c_str(),
+				Hex8(row->suffix).c_str(), sfn_digest.c_str(), static_cast<unsigned>(ow),
+				static_cast<unsigned>(oh));
+			const std::string tmp_man = man_path + ".tmp";
+			WriteFileAtomic(tmp_man, reinterpret_cast<const std::uint8_t*>(man), std::strlen(man));
+			FileSystem::RenamePath(tmp_man.c_str(), man_path.c_str(), nullptr);
+			lock.lock();
+			TrimCacheLocked(dir);
+			lock.unlock();
+		}
 	}
 
 	unsigned lo = 255, hi = 0;
@@ -425,7 +437,8 @@ bool LookupGenerated(const GSTextureCache::HashCacheKey& key, const GIFRegTEX0& 
 	*alpha_minmax = {static_cast<std::uint8_t>(lo), static_cast<std::uint8_t>(hi)};
 	out.width = static_cast<std::uint32_t>(ow);
 	out.height = static_cast<std::uint32_t>(oh);
-	out.format = GSTexture::Format::UNorm8;
+	// Color (RGBA8) like the pack PNG loader produces, not UNorm8 (A8).
+	out.format = GSTexture::Format::Color;
 	out.alpha_minmax = *alpha_minmax;
 	out.pitch = static_cast<std::uint32_t>(ow) * 4;
 	out.data.assign(out_rgba.begin(), out_rgba.end());

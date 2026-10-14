@@ -214,7 +214,7 @@ void UpsampleEdge8(const float* a, int w, int h, std::uint8_t* out)
 
 // Tone map + BOX to 4x (port of raster_ship_alpha, smoothstep default).
 // in8: 8x uint8 EDGE output. Returns 4x uint8.
-void ShipAlpha4x(const std::uint8_t* in8, int w8, int h8, int w1, int h1,
+void ShipAlpha4x(const std::uint8_t* in8, int w8, int h8,
 	float r_sharp, int thresh, std::uint8_t* out4)
 {
 	// numpy staging: g is float32, but g - th promotes to float64
@@ -234,10 +234,7 @@ void ShipAlpha4x(const std::uint8_t* in8, int w8, int h8, int w1, int h1,
 			mapped[static_cast<size_t>(y) * w8 + x] = static_cast<std::uint8_t>(a * 255.0);
 		}
 	}
-	const int w4 = w1 * 4, h4 = h1 * 4;
 	BoxDown2x(mapped.data(), w8, h8, out4);
-	(void)w4;
-	(void)h4;
 }
 
 // Fill predicates mirror fill_mask comparisons exactly (uint8 RGBA in).
@@ -398,7 +395,7 @@ bool BuildFontAtlas(int atlas, const std::uint8_t* stock_rgba, int w, int h,
 			std::vector<std::uint8_t> edge(static_cast<size_t>(rw) * 8 * rh * 8);
 			UpsampleEdge8(inkf.data(), rw, rh, edge.data());
 			std::vector<std::uint8_t> tile4(static_cast<size_t>(rw) * 4 * rh * 4);
-			ShipAlpha4x(edge.data(), rw * 8, rh * 8, rw, rh, 1.0f, 64, tile4.data());
+			ShipAlpha4x(edge.data(), rw * 8, rh * 8, 1.0f, 64, tile4.data());
 			st.regions++;
 			long long sum = 0;
 			for (std::uint8_t v : tile4)
@@ -447,7 +444,7 @@ bool BuildFontAtlas(int atlas, const std::uint8_t* stock_rgba, int w, int h,
 			std::vector<std::uint8_t> edge(static_cast<size_t>(cw) * 8 * ch * 8);
 			UpsampleEdge8(cellf.data(), cw, ch, edge.data());
 			std::vector<std::uint8_t> tile4(static_cast<size_t>(cw) * 4 * ch * 4);
-			ShipAlpha4x(edge.data(), cw * 8, ch * 8, cw, ch, 1.0f, 64, tile4.data());
+			ShipAlpha4x(edge.data(), cw * 8, ch * 8, 1.0f, 64, tile4.data());
 			long long sum = 0;
 			for (std::uint8_t v : tile4)
 				sum += v;
