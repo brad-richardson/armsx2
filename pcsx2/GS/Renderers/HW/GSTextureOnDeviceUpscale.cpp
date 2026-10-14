@@ -277,6 +277,12 @@ bool LookupGenerated(const GSTextureCache::HashCacheKey& key, const GIFRegTEX0& 
 
 	std::unique_lock<std::mutex> lock(s_lock);
 	s_stats.lookups++;
+	if (s_trace && (s_stats.lookups & 1023) == 1)
+	{
+		char msg[96];
+		std::snprintf(msg, sizeof(msg), "lookups=%llu.", s_stats.lookups);
+		LogOnceLocked("look-" + std::to_string(s_stats.lookups), std::string("lookup #") + msg);
+	}
 	if (!s_enabled)
 	{
 		s_stats.skipped_disabled++;
@@ -285,20 +291,32 @@ bool LookupGenerated(const GSTextureCache::HashCacheKey& key, const GIFRegTEX0& 
 	if (FMVstarted)
 	{
 		s_stats.skipped_fmv++;
+		if (s_trace)
+			LogOnceLocked("skip-fmv", "skip: FMVstarted set.");
 		return false;
 	}
 	if (mipmap || key.region_width != 0 || key.region_height != 0)
 	{
 		if (mipmap)
+		{
 			s_stats.skipped_mipmap++;
+			if (s_trace)
+				LogOnceLocked("skip-mipmap", "skip: lod mipmap range set.");
+		}
 		else
+		{
 			s_stats.skipped_region++;
+			if (s_trace)
+				LogOnceLocked("skip-region", "skip: sub-region lookup.");
+		}
 		return false;
 	}
 	// Same guard as the generic upscaler: the CPU CLUT copy must be live.
 	if (GSLocalMemory::m_psm[TEX0.PSM].pal > 0 && mem.m_clut.GetGPUTexture())
 	{
 		s_stats.skipped_gpu_clut++;
+		if (s_trace)
+			LogOnceLocked("skip-gpuclut", "skip: GPU CLUT texture live.");
 		return false;
 	}
 	// Suffix bits use the key's masked TEXA (zero for paletted formats),
