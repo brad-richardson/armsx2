@@ -39,7 +39,9 @@ struct RegistryRow
 };
 
 constexpr char kRecipeWords[] = "raster-edge-v1";
-constexpr char kRecipeArt[] = "lanczos-a-v1";
+// v2: faithful Pillow port (premult round-half-up, Resample.c fixed-point,
+// BoxBlur.c UnsharpMask). v1 cache dirs go stale and are LRU-trimmed.
+constexpr char kRecipeArt[] = "lanczos-a-v2";
 constexpr int kAtlasButtons = 90;
 constexpr int kAtlasFlake = 91;
 
