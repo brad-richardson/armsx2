@@ -249,7 +249,11 @@ void RemoveStaleRecipeDirsLocked(const std::string& root)
 			{
 				if (f.Attributes & FILESYSTEM_FILE_ATTRIBUTE_DIRECTORY)
 					continue;
-				if (FileSystem::DeleteFilePath(Path::Combine(dir, f.FileName).c_str(), nullptr))
+				// NOTE: FileName is already the full path (no RELATIVE_PATHS
+				// flag); combining with dir again breaks the delete. The
+				// same latent shape exists in TrimCacheLocked (dormant:
+				// the 256MB budget never fires), left untouched.
+				if (FileSystem::DeleteFilePath(f.FileName.c_str(), nullptr))
 					removed++;
 			}
 		}
