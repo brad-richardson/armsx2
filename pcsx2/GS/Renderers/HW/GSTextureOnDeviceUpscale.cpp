@@ -2,6 +2,7 @@
 #include "GS/Renderers/HW/GSTextureOnDeviceUpscale.h"
 
 #include "GS/Renderers/HW/GSTextureFontFilter.h"
+#include "GS/Renderers/HW/GSTextureClass3Filter.h"
 #include "common/Console.h"
 #include "common/Error.h"
 #include "common/FileSystem.h"
@@ -30,14 +31,31 @@ struct RegistryRow
 	std::uint32_t suffix;
 	int atlas;
 	std::uint32_t expect_w, expect_h;
-	const char* sfn_file; // atlases 2/72, else nullptr (baked words)
+	const char* sfn_file; // atlases 2/72, else nullptr (baked words / art)
+	const char* recipe; // filter + cache namespace (ODP1 keying)
+	const char* cache_group; // cache dir for rows without sfn_file
+	int alpha_clamp; // lanczos rows: <0 raw alpha, else stock-peak clamp
 };
 
+constexpr char kRecipeWords[] = "raster-edge-v1";
+constexpr char kRecipeArt[] = "lanczos-a-v1";
+constexpr int kAtlasButtons = 90;
+constexpr int kAtlasFlake = 91;
+
 constexpr RegistryRow kRegistry[] = {
-	{0x3be92b30fd7ab98aULL, 0x372720106ade32f4ULL, 0x00002254, 2, 512, 256, "DATA/FONTS/FEFONT.SFN"},
-	{0xb7e032dcd63ad8dbULL, 0x372720106ade32f4ULL, 0x00001e14, 72, 256, 128, "DATA/FONTS/HUDFONT.SFN"},
-	{0x51446d7052987c01ULL, 0xe5708d0189ccd302ULL, 0x0000221b, 70, 256, 256, nullptr},
-	{0xfb36e14323437580ULL, 0x2f302f4bc33356f5ULL, 0x0000221b, 80, 256, 256, nullptr},
+	{0x3be92b30fd7ab98aULL, 0x372720106ade32f4ULL, 0x00002254, 2, 512, 256, "DATA/FONTS/FEFONT.SFN", kRecipeWords, "words-v1", -1},
+	{0xb7e032dcd63ad8dbULL, 0x372720106ade32f4ULL, 0x00001e14, 72, 256, 128, "DATA/FONTS/HUDFONT.SFN", kRecipeWords, "words-v1", -1},
+	{0x51446d7052987c01ULL, 0xe5708d0189ccd302ULL, 0x0000221b, 70, 256, 256, nullptr, kRecipeWords, "words-v1", -1},
+	{0xfb36e14323437580ULL, 0x2f302f4bc33356f5ULL, 0x0000221b, 80, 256, 256, nullptr, kRecipeWords, "words-v1", -1},
+	// REM3 P12 class 3: action buttons ((a)-content: full-atlas Lanczos +
+	// unsharp, raw Lanczos alpha; the staged composite's v5c background
+	// and feather ring are documented tolerance, not reproduced) and the
+	// 2779 loading snowflake x2 CLUT variants (Lanczos + unsharp, alpha
+	// clamped to the stock peak 128; v5f recipe, within tolerance of the
+	// shipped x4plus file since the ML original cannot run on device).
+	{0x2eacf2633330915cULL, 0xdcec7fcad512bfe3ULL, 0x0000221b, kAtlasButtons, 256, 256, nullptr, kRecipeArt, "art-v1", -1},
+	{0x2779a08db7a8aeffULL, 0x1cd1ab68062c5339ULL, 0x0000155b, kAtlasFlake, 32, 32, nullptr, kRecipeArt, "art-v1", 128},
+	{0x2779a08db7a8aeffULL, 0xae8c15bdb2b097cfULL, 0x0000155b, kAtlasFlake, 32, 32, nullptr, kRecipeArt, "art-v1", 128},
 };
 constexpr char kRecipe[] = "raster-edge-v1";
 
@@ -162,7 +180,7 @@ void TrimCacheLocked(const std::string& dir)
 std::string CacheKey(const RegistryRow& row, const std::string& sfn_digest)
 {
 	return "f" + std::to_string(row.atlas) + "-" + Hex16(row.tex0hash) + "-" + Hex16(row.cluthash) + "-" +
-	       Hex8(row.suffix) + "-" + sfn_digest + "-raster-edge-v1";
+	       Hex8(row.suffix) + "-" + sfn_digest + "-" + row.recipe;
 }
 
 } // namespace
@@ -311,7 +329,7 @@ bool LookupGenerated(const GSTextureCache::HashCacheKey& key, const GIFRegTEX0& 
 		row->atlas, Hex16(row->tex0hash).c_str(), Hex16(row->cluthash).c_str(),
 		Hex8(row->suffix).c_str());
 	const SfnStore* sfn = nullptr;
-	std::string sfn_digest = "words-v1";
+	std::string sfn_digest = row->cache_group;
 	if (row->sfn_file)
 	{
 		const int idx = SfnIndex(row->atlas);
@@ -325,7 +343,8 @@ bool LookupGenerated(const GSTextureCache::HashCacheKey& key, const GIFRegTEX0& 
 	}
 	const std::string root = CacheRootLocked();
 	const bool cache_on = !root.empty();
-	const std::string dir = cache_on ? Path::Combine(Path::Combine(root, sfn_digest), kRecipe) : std::string();
+	const std::string dir =
+		cache_on ? Path::Combine(Path::Combine(root, sfn_digest), row->recipe) : std::string();
 	const std::string ckey = CacheKey(*row, sfn_digest);
 	const std::string png_path = cache_on ? Path::Combine(dir, ckey + ".png") : std::string();
 	const std::string man_path = cache_on ? Path::Combine(dir, ckey + ".manifest") : std::string();
@@ -403,10 +422,22 @@ bool LookupGenerated(const GSTextureCache::HashCacheKey& key, const GIFRegTEX0& 
 	std::vector<std::uint8_t> out_rgba;
 	int ow = 0, oh = 0;
 	GE1FontFilter::Stats fstat;
-	const GE1FontFilter::SfnRow* sfn_rows = sfn ? sfn->rows.data() : nullptr;
-	const int sfn_n = sfn ? static_cast<int>(sfn->rows.size()) : 0;
-	if (!GE1FontFilter::BuildFontAtlas(row->atlas, tight.data(), static_cast<int>(dw), static_cast<int>(dh),
-			sfn_rows, sfn_n, out_rgba, ow, oh, &fstat))
+	bool built = false;
+	if (std::strcmp(row->recipe, kRecipeArt) == 0)
+	{
+		double art_ms = 0.0;
+		built = GE1Class3Filter::BuildLanczosAtlas(tight.data(), static_cast<int>(dw), static_cast<int>(dh),
+			row->alpha_clamp, out_rgba, ow, oh, &art_ms);
+		fstat.ms = art_ms;
+	}
+	else
+	{
+		const GE1FontFilter::SfnRow* sfn_rows = sfn ? sfn->rows.data() : nullptr;
+		const int sfn_n = sfn ? static_cast<int>(sfn->rows.size()) : 0;
+		built = GE1FontFilter::BuildFontAtlas(row->atlas, tight.data(), static_cast<int>(dw), static_cast<int>(dh),
+			sfn_rows, sfn_n, out_rgba, ow, oh, &fstat);
+	}
+	if (!built)
 	{
 		lock.lock();
 		s_stats.skipped_geometry++;
@@ -430,7 +461,7 @@ bool LookupGenerated(const GSTextureCache::HashCacheKey& key, const GIFRegTEX0& 
 			std::snprintf(man, sizeof(man),
 				"ondevice-upscale-manifest-v1\nrecipe=%s sharp=1.0 thresh=64 mode=smoothstep\n"
 				"tex0=%s clut=%s suffix=%s\nsfn=%s\ndims=%ux%u\n",
-				kRecipe, Hex16(row->tex0hash).c_str(), Hex16(row->cluthash).c_str(),
+				row->recipe, Hex16(row->tex0hash).c_str(), Hex16(row->cluthash).c_str(),
 				Hex8(row->suffix).c_str(), sfn_digest.c_str(), static_cast<unsigned>(ow),
 				static_cast<unsigned>(oh));
 			const std::string tmp_man = man_path + ".tmp";

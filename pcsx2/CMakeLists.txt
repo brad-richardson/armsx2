@@ -608,6 +608,7 @@ set(pcsx2GSSources
 	GS/Renderers/HW/GSLineRuns.cpp
 	GS/Renderers/HW/GSRendererHW.cpp
 	GS/Renderers/HW/GSTextureCache.cpp
+	GS/Renderers/HW/GSTextureClass3Filter.cpp
 	GS/Renderers/HW/GSTextureFontFilter.cpp
 	GS/Renderers/HW/GSTextureOnDeviceUpscale.cpp
 	GS/Renderers/HW/GSTextureReplacementLoaders.cpp
@@ -708,6 +709,7 @@ set(pcsx2GSHeaders
 	GS/Renderers/HW/GSSpriteEdgeSnap.h
 	GS/Renderers/HW/GSTexelAddressedDraw.h
 	GS/Renderers/HW/GSTextureCache.h
+	GS/Renderers/HW/GSTextureClass3Filter.h
 	GS/Renderers/HW/GSTextureFontFilter.h
 	GS/Renderers/HW/GSTextureFontTables.inc
 	GS/Renderers/HW/GSTextureOnDeviceUpscale.h
