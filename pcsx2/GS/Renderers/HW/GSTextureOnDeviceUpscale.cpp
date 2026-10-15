@@ -51,12 +51,14 @@ constexpr RegistryRow kRegistry[] = {
 	{0x51446d7052987c01ULL, 0xe5708d0189ccd302ULL, 0x0000221b, 70, 256, 256, nullptr, kRecipeWords, "words-v1", -1, false},
 	{0xfb36e14323437580ULL, 0x2f302f4bc33356f5ULL, 0x0000221b, 80, 256, 256, nullptr, kRecipeWords, "words-v1", -1, false},
 	// REM3 P12 class 3: action buttons ((a)-content: full-atlas Lanczos +
-	// unsharp, raw Lanczos alpha; the staged composite's v5c background
-	// and feather ring are documented tolerance, not reproduced) and the
-	// 2779 loading snowflake x2 CLUT variants (Lanczos + unsharp, alpha
-	// clamped to the stock peak 128; v5f recipe, within tolerance of the
-	// shipped x4plus file since the ML original cannot run on device).
-	{0x2eacf2633330915cULL, 0xdcec7fcad512bfe3ULL, 0x0000221b, kAtlasButtons, 256, 256, nullptr, kRecipeArt, "art-v1", -1, false},
+	// unsharp, alpha clamped to the PS2 peak 128 — raw overshoot above
+	// 0x80 is over 100% opacity, so the P12 raw-alpha choice was wrong;
+	// the staged composite's v5c background and feather ring remain
+	// documented tolerance, not reproduced) and the 2779 loading snowflake
+	// x2 CLUT variants (Lanczos + unsharp, alpha clamped to the stock
+	// peak 128; v5f recipe, within tolerance of the shipped x4plus file
+	// since the ML original cannot run on device).
+	{0x2eacf2633330915cULL, 0xdcec7fcad512bfe3ULL, 0x0000221b, kAtlasButtons, 256, 256, nullptr, kRecipeArt, "art-v1", 128, false},
 	{0x2779a08db7a8aeffULL, 0x1cd1ab68062c5339ULL, 0x0000155b, kAtlasFlake, 32, 32, nullptr, kRecipeArt, "art-v1", 128, false},
 	{0x2779a08db7a8aeffULL, 0xae8c15bdb2b097cfULL, 0x0000155b, kAtlasFlake, 32, 32, nullptr, kRecipeArt, "art-v1", 128, false},
 	// REM3 P13 classes 4-5: 11 menu-key textures (atlas 100+) + 47 Tricky
@@ -216,6 +218,47 @@ bool WriteFileAtomic(const std::string& path, const std::uint8_t* data, std::siz
 	return FileSystem::RenamePath(tmp.c_str(), path.c_str(), nullptr);
 }
 
+// Superseded recipe dirs (explicit group + recipe pairs). Removed once at
+// provider start so stale bytes can never warm-hit: only the provider's own
+// cache root is touched, only provider-written extensions are deleted, and
+// the dir itself is removed only when empty. Every removal is logged.
+constexpr const char* kStaleRecipeDirs[][2] = {
+	{"art-v1", "lanczos-a-v1"},
+};
+
+bool HasSuffix(const std::string& name, const char* suffix)
+{
+	const std::size_t n = std::strlen(suffix);
+	return name.size() >= n && name.compare(name.size() - n, n, suffix) == 0;
+}
+
+void RemoveStaleRecipeDirsLocked(const std::string& root)
+{
+	if (root.empty())
+		return;
+	for (const auto& stale : kStaleRecipeDirs)
+	{
+		const std::string dir = Path::Combine(Path::Combine(root, stale[0]), stale[1]);
+		FileSystem::FindResultsArray files;
+		if (!FileSystem::FindFiles(dir.c_str(), "*", FILESYSTEM_FIND_FILES, &files, nullptr))
+			continue; // absent (or unreadable): nothing to do
+		int removed = 0;
+		for (const auto& f : files)
+		{
+			if (f.Attributes & FILESYSTEM_FILE_ATTRIBUTE_DIRECTORY)
+				continue;
+			if (!HasSuffix(f.FileName, ".png") && !HasSuffix(f.FileName, ".manifest") &&
+				!HasSuffix(f.FileName, ".tmp"))
+				continue; // not ours: leave it (dir removal below then fails safe)
+			if (FileSystem::DeleteFilePath(Path::Combine(dir, f.FileName).c_str(), nullptr))
+				removed++;
+		}
+		const bool rmdir = FileSystem::DeleteDirectory(dir.c_str());
+		Console.WriteLn("ODU: stale recipe dir %s/%s: removed %d files, dir %s.", stale[0], stale[1],
+			removed, rmdir ? "removed" : "kept");
+	}
+}
+
 // Deletes oldest PNGs (with manifests) while the recipe dir exceeds budget.
 void TrimCacheLocked(const std::string& dir)
 {
@@ -288,6 +331,7 @@ void InitializeFromEnvironment()
 			}
 		}
 	}
+	RemoveStaleRecipeDirsLocked(CacheRootLocked());
 	Console.WriteLn("ODU: on-device upscale %s (sfn %d/2, cache %s).", s_enabled ? "ON" : "off", loaded,
 		CacheRootLocked().c_str());
 }
