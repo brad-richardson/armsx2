@@ -226,33 +226,35 @@ constexpr const char* kStaleRecipeDirs[][2] = {
 	{"art-v1", "lanczos-a-v1"},
 };
 
-bool HasSuffix(const std::string& name, const char* suffix)
-{
-	const std::size_t n = std::strlen(suffix);
-	return name.size() >= n && name.compare(name.size() - n, n, suffix) == 0;
-}
-
 void RemoveStaleRecipeDirsLocked(const std::string& root)
 {
 	if (root.empty())
 		return;
+	// Same FindFiles call shape as TrimCacheLocked (proven): one pattern per
+	// provider-written extension, flags 0. A bare "*" listing proved
+	// unreliable here (P13 gate: listed nothing, removed 0).
+	constexpr const char* kOurs[] = {"*.png", "*.manifest", "*.tmp"};
 	for (const auto& stale : kStaleRecipeDirs)
 	{
 		const std::string dir = Path::Combine(Path::Combine(root, stale[0]), stale[1]);
-		FileSystem::FindResultsArray files;
-		if (!FileSystem::FindFiles(dir.c_str(), "*", FILESYSTEM_FIND_FILES, &files, nullptr))
-			continue; // absent (or unreadable): nothing to do
 		int removed = 0;
-		for (const auto& f : files)
+		bool present = false;
+		for (const char* pat : kOurs)
 		{
-			if (f.Attributes & FILESYSTEM_FILE_ATTRIBUTE_DIRECTORY)
-				continue;
-			if (!HasSuffix(f.FileName, ".png") && !HasSuffix(f.FileName, ".manifest") &&
-				!HasSuffix(f.FileName, ".tmp"))
-				continue; // not ours: leave it (dir removal below then fails safe)
-			if (FileSystem::DeleteFilePath(Path::Combine(dir, f.FileName).c_str(), nullptr))
-				removed++;
+			FileSystem::FindResultsArray files;
+			if (!FileSystem::FindFiles(dir.c_str(), pat, 0, &files, nullptr))
+				continue; // absent (or unreadable): nothing to do
+			present = true;
+			for (const auto& f : files)
+			{
+				if (f.Attributes & FILESYSTEM_FILE_ATTRIBUTE_DIRECTORY)
+					continue;
+				if (FileSystem::DeleteFilePath(Path::Combine(dir, f.FileName).c_str(), nullptr))
+					removed++;
+			}
 		}
+		if (!present)
+			continue;
 		const bool rmdir = FileSystem::DeleteDirectory(dir.c_str());
 		Console.WriteLn("ODU: stale recipe dir %s/%s: removed %d files, dir %s.", stale[0], stale[1],
 			removed, rmdir ? "removed" : "kept");
