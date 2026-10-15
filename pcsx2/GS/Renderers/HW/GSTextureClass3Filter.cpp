@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <cmath>
+#include <cstring>
 
 namespace GE1Class3Filter
 {
@@ -9,97 +10,271 @@ namespace
 {
 
 constexpr double kPi = 3.14159265358979323846;
-constexpr double kScale = 4.0;
-constexpr int kLobes = 3;
-constexpr double kGaussSigma = 2.0;
-constexpr double kGaussSpan = 3.0;
-constexpr double kUnsharpPercent = 50.0;
-constexpr double kUnsharpThreshold = 3.0;
+constexpr int kUnsharpPercent = 50;
+constexpr int kUnsharpThreshold = 3;
+constexpr int kBoxPasses = 3;
 
-double Sinc(double x)
+// Pillow Resample.c port (LANCZOS): per-output-pixel bounds, double coeffs
+// normalized per pixel, INT32 fixed-point (2^22, half-up), accumulate from
+// 2^21, clip to uint8. H-pass writes uint8, V-pass reads it — the clip
+// between passes (including negative-lobe clipping) is part of the recipe.
+constexpr int kResamplePrecision = 22;
+
+double PillowSinc(double x)
 {
 	if (x == 0.0)
 		return 1.0;
-	const double pix = kPi * x;
-	return std::sin(pix) / pix;
+	x *= kPi;
+	return std::sin(x) / x;
 }
 
-double LanczosKernel(double d)
+double PillowLanczos(double x)
 {
-	d = d < 0.0 ? -d : d;
-	if (d >= kLobes)
-		return 0.0;
-	return Sinc(d) * Sinc(d / kLobes);
+	if (-3.0 <= x && x < 3.0)
+		return PillowSinc(x) * PillowSinc(x / 3);
+	return 0.0;
 }
 
-double ClampPlane(double v, double lo, double hi)
+struct ResampleCoeffs
 {
-	return v < lo ? lo : (v > hi ? hi : v);
-}
+	int ksize = 0;
+	std::vector<int> xmin; // per output pixel
+	std::vector<int> count; // per output pixel
+	std::vector<std::int32_t> k; // per output pixel x ksize, fixed-point
+};
 
-// Separable Lanczos 4x of one double plane, mirroring the fitted numpy
-// op order (row pass into tmp, then column pass; per-pixel renormalized
-// clamped 6-tap weights).
-void Lanczos4xPlane(const double* in, int w, int h, double* out)
+void PrecomputeCoeffs(int inSize, int outSize, ResampleCoeffs& c)
 {
-	const int W = static_cast<int>(w * kScale);
-	const int H = static_cast<int>(h * kScale);
-	std::vector<double> tmp(static_cast<size_t>(h) * W);
-	for (int j = 0; j < W; j++)
+	const double scale = static_cast<double>(inSize) / outSize;
+	const double filterscale = scale < 1.0 ? 1.0 : scale;
+	const double support = 3.0 * filterscale;
+	const double inv = 1.0 / filterscale;
+	c.ksize = static_cast<int>(std::ceil(support)) * 2 + 1;
+	c.xmin.assign(outSize, 0);
+	c.count.assign(outSize, 0);
+	c.k.assign(static_cast<size_t>(outSize) * c.ksize, 0);
+	for (int xx = 0; xx < outSize; xx++)
 	{
-		const double x = (j + 0.5) / kScale - 0.5;
-		int idx[2 * kLobes];
-		double k[2 * kLobes];
-		const int i0 = static_cast<int>(std::floor(x)) - (kLobes - 1);
-		double sum = 0.0;
-		for (int t = 0; t < 2 * kLobes; t++)
+		const double center = (xx + 0.5) * scale;
+		double ww = 0.0;
+		int xmin = static_cast<int>(center - support + 0.5);
+		if (xmin < 0)
+			xmin = 0;
+		int xmax = static_cast<int>(center + support + 0.5);
+		if (xmax > inSize)
+			xmax = inSize;
+		xmax -= xmin;
+		std::vector<double> w(static_cast<size_t>(c.ksize), 0.0);
+		for (int x = 0; x < xmax; x++)
 		{
-			const int s = i0 + t;
-			idx[t] = s < 0 ? 0 : (s > w - 1 ? w - 1 : s);
-			k[t] = LanczosKernel(x - s);
-			sum += k[t];
+			const double wt = PillowLanczos((x + xmin - center + 0.5) * inv);
+			w[x] = wt;
+			ww += wt;
 		}
-		for (int t = 0; t < 2 * kLobes; t++)
-			k[t] /= sum;
+		if (ww != 0.0)
+		{
+			for (int x = 0; x < xmax; x++)
+			{
+				const double n = w[x] / ww * (1 << kResamplePrecision);
+				c.k[static_cast<size_t>(xx) * c.ksize + x] =
+					static_cast<std::int32_t>(n < 0 ? -0.5 + n : 0.5 + n);
+			}
+		}
+		c.xmin[xx] = xmin;
+		c.count[xx] = xmax;
+	}
+}
+
+std::int32_t ClipResample(std::int64_t ss)
+{
+	const std::int64_t v = ss >> kResamplePrecision;
+	if (v < 0)
+		return 0;
+	if (v > 255)
+		return 255;
+	return static_cast<std::int32_t>(v);
+}
+
+void ResampleHPlane(const std::uint8_t* in, std::uint8_t* out, int w, int h, int W,
+	const ResampleCoeffs& c)
+{
+	for (int yy = 0; yy < h; yy++)
+	{
+		const std::uint8_t* lineIn = in + static_cast<size_t>(yy) * w;
+		std::uint8_t* lineOut = out + static_cast<size_t>(yy) * W;
+		for (int xx = 0; xx < W; xx++)
+		{
+			const int xmin = c.xmin[xx];
+			const int xmax = c.count[xx];
+			const std::int32_t* k = &c.k[static_cast<size_t>(xx) * c.ksize];
+			std::int64_t ss = static_cast<std::int64_t>(1) << (kResamplePrecision - 1);
+			for (int x = 0; x < xmax; x++)
+				ss += static_cast<std::int64_t>(lineIn[x + xmin]) * k[x];
+			lineOut[xx] = static_cast<std::uint8_t>(ClipResample(ss));
+		}
+	}
+}
+
+void ResampleVPlane(const std::uint8_t* in, std::uint8_t* out, int W, int h, int H,
+	const ResampleCoeffs& c)
+{
+	for (int xx = 0; xx < W; xx++)
+	{
+		for (int yy = 0; yy < H; yy++)
+		{
+			const int ymin = c.xmin[yy];
+			const int ymax = c.count[yy];
+			const std::int32_t* k = &c.k[static_cast<size_t>(yy) * c.ksize];
+			std::int64_t ss = static_cast<std::int64_t>(1) << (kResamplePrecision - 1);
+			for (int y = 0; y < ymax; y++)
+				ss += static_cast<std::int64_t>(in[static_cast<size_t>(y + ymin) * W + xx]) * k[y];
+			out[static_cast<size_t>(yy) * W + xx] = static_cast<std::uint8_t>(ClipResample(ss));
+		}
+	}
+}
+
+// Full Pillow resize of one uint8 band (H uint8 intermediate, like Pillow).
+void PillowResizeBand(const std::uint8_t* in, int w, int h, std::uint8_t* out, int W, int H)
+{
+	ResampleCoeffs ch, cv;
+	PrecomputeCoeffs(w, W, ch);
+	PrecomputeCoeffs(h, H, cv);
+	std::vector<std::uint8_t> mid(static_cast<size_t>(W) * h);
+	ResampleHPlane(in, mid.data(), w, h, W, ch);
+	ResampleVPlane(mid.data(), out, W, h, H, cv);
+}
+
+// Pillow BoxBlur.c (ImagingLineBoxBlur8) verbatim port for one strided
+// single-band line: fixed-point weights ww/fw, round-half-up SAVE, clamped
+// edges. out must not alias in within a pass (ping-pong buffers).
+void BoxBlurLine(const std::uint8_t* in, std::uint8_t* out, int len, int stride,
+	int radius, int edgeA, int edgeB, std::uint32_t ww, std::uint32_t fw)
+{
+	std::uint64_t acc = static_cast<std::uint64_t>(in[0]) * static_cast<std::uint64_t>(radius + 1);
+	for (int x = 0; x < edgeA - 1; x++)
+		acc += in[static_cast<size_t>(x) * stride];
+	acc += static_cast<std::uint64_t>(in[static_cast<size_t>(len - 1) * stride]) *
+		static_cast<std::uint64_t>(radius - edgeA + 1);
+	if (edgeA <= edgeB)
+	{
+		for (int x = 0; x < edgeA; x++)
+		{
+			acc += in[static_cast<size_t>(x + radius) * stride] - in[0];
+			const std::uint64_t bulk = acc * ww +
+				(static_cast<std::uint64_t>(in[0]) + in[static_cast<size_t>(x + radius + 1) * stride]) * fw;
+			out[static_cast<size_t>(x) * stride] = static_cast<std::uint8_t>((bulk + (1u << 23)) >> 24);
+		}
+		for (int x = edgeA; x < edgeB; x++)
+		{
+			acc += in[static_cast<size_t>(x + radius) * stride] - in[static_cast<size_t>(x - radius - 1) * stride];
+			const std::uint64_t bulk = acc * ww +
+				(static_cast<std::uint64_t>(in[static_cast<size_t>(x - radius - 1) * stride]) +
+					in[static_cast<size_t>(x + radius + 1) * stride]) * fw;
+			out[static_cast<size_t>(x) * stride] = static_cast<std::uint8_t>((bulk + (1u << 23)) >> 24);
+		}
+		for (int x = edgeB; x < len; x++)
+		{
+			acc += in[static_cast<size_t>(len - 1) * stride] - in[static_cast<size_t>(x - radius - 1) * stride];
+			const std::uint64_t bulk = acc * ww +
+				(static_cast<std::uint64_t>(in[static_cast<size_t>(x - radius - 1) * stride]) +
+					in[static_cast<size_t>(len - 1) * stride]) * fw;
+			out[static_cast<size_t>(x) * stride] = static_cast<std::uint8_t>((bulk + (1u << 23)) >> 24);
+		}
+	}
+	else
+	{
+		for (int x = 0; x < edgeB; x++)
+		{
+			acc += in[static_cast<size_t>(x + radius) * stride] - in[0];
+			const std::uint64_t bulk = acc * ww +
+				(static_cast<std::uint64_t>(in[0]) + in[static_cast<size_t>(x + radius + 1) * stride]) * fw;
+			out[static_cast<size_t>(x) * stride] = static_cast<std::uint8_t>((bulk + (1u << 23)) >> 24);
+		}
+		for (int x = edgeB; x < edgeA; x++)
+		{
+			acc += in[static_cast<size_t>(len - 1) * stride] - in[0];
+			const std::uint64_t bulk = acc * ww +
+				(static_cast<std::uint64_t>(in[0]) + in[static_cast<size_t>(len - 1) * stride]) * fw;
+			out[static_cast<size_t>(x) * stride] = static_cast<std::uint8_t>((bulk + (1u << 23)) >> 24);
+		}
+		for (int x = edgeA; x < len; x++)
+		{
+			acc += in[static_cast<size_t>(len - 1) * stride] - in[static_cast<size_t>(x - radius - 1) * stride];
+			const std::uint64_t bulk = acc * ww +
+				(static_cast<std::uint64_t>(in[static_cast<size_t>(x - radius - 1) * stride]) +
+					in[static_cast<size_t>(len - 1) * stride]) * fw;
+			out[static_cast<size_t>(x) * stride] = static_cast<std::uint8_t>((bulk + (1u << 23)) >> 24);
+		}
+	}
+}
+
+// Gwosdek boxes-for-Gauss box radius, replicating BoxBlur.c float math.
+// radius 2, 3 passes -> 1.375 (int radius 1, ww 4473924, fw 1677722).
+float BoxRadiusForGauss(float radius, int passes)
+{
+	const float sigma2 = radius * radius / passes;
+	const float L = static_cast<float>(std::sqrt(12.0 * sigma2 + 1.0));
+	const float l = std::floor((L - 1.0f) / 2.0f);
+	float a = (2 * l + 1) * (l * (l + 1) - 3 * sigma2);
+	a /= 6 * (sigma2 - (l + 1) * (l + 1));
+	return l + a;
+}
+
+// Pillow GaussianBlur(radius=2): 3 horizontal box passes, 3 vertical
+// (strided; transpose-exact), uint8 between passes. One band.
+void PillowBlur2(const std::uint8_t* in, std::uint8_t* out, int w, int h)
+{
+	const float floatRadius = BoxRadiusForGauss(2.0f, kBoxPasses);
+	const int radius = static_cast<int>(floatRadius);
+	const std::uint32_t ww = static_cast<std::uint32_t>(16777216.0f / (floatRadius * 2 + 1));
+	const std::uint32_t fw = (16777216u - static_cast<std::uint32_t>(radius * 2 + 1) * ww) / 2;
+	const size_t n = static_cast<size_t>(w) * h;
+	std::vector<std::uint8_t> ping(n), pong(n);
+	std::memcpy(ping.data(), in, n);
+	const int edgeAH = radius + 1 < w ? radius + 1 : w;
+	const int edgeBH = w - radius - 1 > 0 ? w - radius - 1 : 0;
+	for (int p = 0; p < kBoxPasses; p++)
+	{
 		for (int y = 0; y < h; y++)
-		{
-			double acc = 0.0;
-			for (int t = 0; t < 2 * kLobes; t++)
-				acc += in[static_cast<size_t>(y) * w + idx[t]] * k[t];
-			tmp[static_cast<size_t>(y) * W + j] = acc;
-		}
+			BoxBlurLine(ping.data() + static_cast<size_t>(y) * w, pong.data() + static_cast<size_t>(y) * w,
+				w, 1, radius, edgeAH, edgeBH, ww, fw);
+		ping.swap(pong);
 	}
-	for (int i = 0; i < H; i++)
+	const int edgeAV = radius + 1 < h ? radius + 1 : h;
+	const int edgeBV = h - radius - 1 > 0 ? h - radius - 1 : 0;
+	for (int p = 0; p < kBoxPasses; p++)
 	{
-		const double y = (i + 0.5) / kScale - 0.5;
-		int idx[2 * kLobes];
-		double k[2 * kLobes];
-		const int j0 = static_cast<int>(std::floor(y)) - (kLobes - 1);
-		double sum = 0.0;
-		for (int t = 0; t < 2 * kLobes; t++)
-		{
-			const int s = j0 + t;
-			idx[t] = s < 0 ? 0 : (s > h - 1 ? h - 1 : s);
-			k[t] = LanczosKernel(y - s);
-			sum += k[t];
-		}
-		for (int t = 0; t < 2 * kLobes; t++)
-			k[t] /= sum;
-		for (int j = 0; j < W; j++)
-		{
-			double acc = 0.0;
-			for (int t = 0; t < 2 * kLobes; t++)
-				acc += tmp[static_cast<size_t>(idx[t]) * W + j] * k[t];
-			// rint (banker's, like numpy) matches the fitted chain: the
-			// recipe rounds each Lanczos plane before unpremultiplying.
-			out[static_cast<size_t>(i) * W + j] = std::rint(acc);
-		}
+		for (int x = 0; x < w; x++)
+			BoxBlurLine(ping.data() + x, pong.data() + x, h, w, radius, edgeAV, edgeBV, ww, fw);
+		ping.swap(pong);
 	}
+	std::memcpy(out, ping.data(), n);
 }
 
-double HalfUp(double v)
+// Pillow RGBA resize premultiplication (Convert.c): Image.resize on RGBA
+// converts to RGBa first and back after. Premult rounds half-up
+// ((v*a+127)/255); unpremult truncates (255*p/a, clipped), passing alpha
+// 0/255 through. Probed off Pillow 12.3 (REM3 P13).
+void PremultBand(const std::uint8_t* rgb, const std::uint8_t* alpha, std::uint8_t* out, size_t n)
 {
-	return std::floor(v + 0.5);
+	for (size_t i = 0; i < n; i++)
+		out[i] = static_cast<std::uint8_t>(
+			(static_cast<unsigned>(rgb[i]) * alpha[i] + 127) / 255);
+}
+
+void UnpremultBand(const std::uint8_t* premult, const std::uint8_t* alpha, std::uint8_t* out, size_t n)
+{
+	for (size_t i = 0; i < n; i++)
+	{
+		const unsigned a = alpha[i];
+		if (a == 255 || a == 0)
+			out[i] = premult[i];
+		else
+		{
+			const unsigned v = (255u * premult[i]) / a;
+			out[i] = static_cast<std::uint8_t>(v > 255 ? 255 : v);
+		}
+	}
 }
 
 } // namespace
@@ -114,109 +289,78 @@ bool BuildLanczosAtlas(const std::uint8_t* stock_rgba, int w, int h, int alpha_c
 	const size_t n = static_cast<size_t>(w) * h;
 	const size_t n4 = static_cast<size_t>(W) * H;
 
-	// Split planes as doubles.
-	std::vector<double> plane[4];
-	for (int c = 0; c < 4; c++)
+	// v5f art recipe (build_options.lanczos): premultiply the stock (round
+	// half-up), Pillow-resize the RGBa bands, unpremultiply back to straight
+	// RGB (truncate, clip: the resize call's RGBa->RGBA convert), UnsharpMask
+	// the straight RGB (convert('RGB') drops the band), and attach the
+	// resized alpha clamped to the row peak.
+	std::vector<std::uint8_t> up[4], bands(n4 * 3), alpha(n4), blur(n4 * 3);
 	{
-		plane[c].resize(n);
-		for (size_t i = 0; i < n; i++)
-			plane[c][i] = stock_rgba[i * 4 + c];
-	}
-
-	// Premultiply RGB by alpha (half-up), mirroring Pillow's RGBA path.
-	std::vector<double> pre[3];
-	for (int c = 0; c < 3; c++)
-	{
-		pre[c].resize(n);
-		for (size_t i = 0; i < n; i++)
-			pre[c][i] = HalfUp(plane[c][i] * plane[3][i] / 255.0);
-	}
-
-	// Lanczos each band (premultiplied RGB + alpha), clip, half-up.
-	std::vector<double> up[4];
-	for (int c = 0; c < 3; c++)
-	{
-		up[c].resize(n4);
-		Lanczos4xPlane(pre[c].data(), w, h, up[c].data());
-	}
-	up[3].resize(n4);
-	Lanczos4xPlane(plane[3].data(), w, h, up[3].data());
-	std::vector<double> rgb(n4 * 3), alpha(n4);
-	for (size_t i = 0; i < n4; i++)
-	{
-		const double a = HalfUp(ClampPlane(up[3][i], 0.0, 255.0));
-		alpha[i] = a;
+		std::vector<std::uint8_t> band(n), pre(n);
 		for (int c = 0; c < 3; c++)
 		{
-			const double p = ClampPlane(up[c][i], 0.0, 255.0);
-			rgb[i * 3 + c] = (a == 0.0) ? 0.0 : HalfUp(p * 255.0 / a);
+			for (size_t i = 0; i < n; i++)
+				band[i] = stock_rgba[i * 4 + c];
+			for (size_t i = 0; i < n; i++)
+				pre[i] = stock_rgba[i * 4 + 3];
+			// premultiply by the stock alpha (alpha band resizes straight)
+			std::vector<std::uint8_t> prem(n);
+			PremultBand(band.data(), pre.data(), prem.data(), n);
+			up[c].resize(n4);
+			PillowResizeBand(prem.data(), w, h, up[c].data(), W, H);
+		}
+		{
+			std::vector<std::uint8_t> ab(n);
+			for (size_t i = 0; i < n; i++)
+				ab[i] = stock_rgba[i * 4 + 3];
+			up[3].resize(n4);
+			PillowResizeBand(ab.data(), w, h, up[3].data(), W, H);
+		}
+		std::vector<std::uint8_t> un(n4);
+		for (size_t i = 0; i < n4; i++)
+			alpha[i] = up[3][i];
+		for (int c = 0; c < 3; c++)
+		{
+			UnpremultBand(up[c].data(), up[3].data(), un.data(), n4);
+			for (size_t i = 0; i < n4; i++)
+				bands[i * 3 + c] = un[i];
+		}
+	}
+	// Pillow GaussianBlur(radius=2) of the resized RGB, one band at a time.
+	{
+		std::vector<std::uint8_t> band(n4), bout(n4);
+		for (int c = 0; c < 3; c++)
+		{
+			for (size_t i = 0; i < n4; i++)
+				band[i] = bands[i * 3 + c];
+			PillowBlur2(band.data(), bout.data(), W, H);
+			for (size_t i = 0; i < n4; i++)
+				blur[i * 3 + c] = bout[i];
 		}
 	}
 
-	// Gaussian blur of the rounded RGB (sigma 2, span 3, edge-clamped).
-	const int gr = static_cast<int>(kGaussSigma * kGaussSpan + 0.5);
-	std::vector<double> gk(static_cast<size_t>(2 * gr + 1));
-	{
-		double sum = 0.0;
-		for (int t = -gr; t <= gr; t++)
-		{
-			const double v = std::exp(-0.5 * (t / kGaussSigma) * (t / kGaussSigma));
-			gk[t + gr] = v;
-			sum += v;
-		}
-		for (double& v : gk)
-			v /= sum;
-	}
-	std::vector<double> blur(n4 * 3, 0.0), tmp(n4 * 3, 0.0);
-	for (int c = 0; c < 3; c++)
-	{
-		for (int y = 0; y < H; y++)
-		{
-			for (int j = 0; j < W; j++)
-			{
-				double acc = 0.0;
-				for (int t = -gr; t <= gr; t++)
-				{
-					int jj = j + t;
-					jj = jj < 0 ? 0 : (jj > W - 1 ? W - 1 : jj);
-					acc += rgb[(static_cast<size_t>(y) * W + jj) * 3 + c] * gk[t + gr];
-				}
-				tmp[(static_cast<size_t>(y) * W + j) * 3 + c] = acc;
-			}
-		}
-		for (int i = 0; i < H; i++)
-		{
-			for (int j = 0; j < W; j++)
-			{
-				double acc = 0.0;
-				for (int t = -gr; t <= gr; t++)
-				{
-					int ii = i + t;
-					ii = ii < 0 ? 0 : (ii > H - 1 ? H - 1 : ii);
-					acc += tmp[(static_cast<size_t>(ii) * W + j) * 3 + c] * gk[t + gr];
-				}
-				blur[(static_cast<size_t>(i) * W + j) * 3 + c] = acc;
-			}
-		}
-	}
-
-	// Per-channel unsharp, half-up quantize; alpha raw or clamped.
+	// Per-channel Pillow UnsharpMask(radius=2, percent=50, threshold=3):
+	// diff = orig - blurred (uint8 both); sharpen iff |diff| > 3;
+	// out = clip(orig + diff*50/100) with C truncation toward zero.
 	out_rgba.resize(n4 * 4);
 	for (size_t i = 0; i < n4; i++)
 	{
 		for (int c = 0; c < 3; c++)
 		{
-			const double v = rgb[i * 3 + c];
-			const double d = v - blur[i * 3 + c];
-			const double s = (d >= kUnsharpThreshold || d <= -kUnsharpThreshold) ?
-			                 v + d * kUnsharpPercent / 100.0 :
-			                 v;
-			out_rgba[i * 4 + c] = static_cast<std::uint8_t>(ClampPlane(HalfUp(s), 0.0, 255.0));
+			const int v = static_cast<int>(bands[i * 3 + c]);
+			const int d = v - static_cast<int>(blur[i * 3 + c]);
+			int u = v;
+			if (d > kUnsharpThreshold || d < -kUnsharpThreshold)
+			{
+				u = v + d * kUnsharpPercent / 100;
+				u = u < 0 ? 0 : (u > 255 ? 255 : u);
+			}
+			out_rgba[i * 4 + c] = static_cast<std::uint8_t>(u);
 		}
-		double a = alpha[i];
+		int a = static_cast<int>(alpha[i]);
 		if (alpha_clamp >= 0 && a > alpha_clamp)
 			a = alpha_clamp;
-		out_rgba[i * 4 + 3] = static_cast<std::uint8_t>(ClampPlane(a, 0.0, 255.0));
+		out_rgba[i * 4 + 3] = static_cast<std::uint8_t>(a);
 	}
 	out_w = W;
 	out_h = H;
@@ -227,4 +371,42 @@ bool BuildLanczosAtlas(const std::uint8_t* stock_rgba, int w, int h, int alpha_c
 	return true;
 }
 
+// One mip step of the RMT9 DDS chain: the previous RGBA level through
+// Pillow's RGBA resize (premult round half-up, Resample.c fixed-point,
+// unpremult truncate+clip). Alpha resizes straight.
+bool BuildMipLevel(const std::uint8_t* prev_rgba, int w, int h,
+	std::vector<std::uint8_t>& out_rgba, int& out_w, int& out_h, double* ms)
+{
+	if (!prev_rgba || w <= 0 || h <= 0 || (w == 1 && h == 1))
+		return false;
+	const auto t0 = std::chrono::steady_clock::now();
+	out_w = w == 1 ? 1 : w / 2;
+	out_h = h == 1 ? 1 : h / 2;
+	const size_t n = static_cast<size_t>(w) * h;
+	const size_t nm = static_cast<size_t>(out_w) * out_h;
+
+	// RMT9 chain() resizes the RGBA level: premultiply (round half-up),
+	// Pillow-resize, unpremultiply (truncate, clip). Alpha resizes straight.
+	std::vector<std::uint8_t> band(n), prem(n), bout(nm), alpha(n), alphaOut(nm);
+	for (size_t i = 0; i < n; i++)
+		alpha[i] = prev_rgba[i * 4 + 3];
+	PillowResizeBand(alpha.data(), w, h, alphaOut.data(), out_w, out_h);
+	out_rgba.resize(nm * 4);
+	for (int c = 0; c < 3; c++)
+	{
+		for (size_t i = 0; i < n; i++)
+			band[i] = prev_rgba[i * 4 + c];
+		PremultBand(band.data(), alpha.data(), prem.data(), n);
+		PillowResizeBand(prem.data(), w, h, bout.data(), out_w, out_h);
+		std::vector<std::uint8_t> un(nm);
+		UnpremultBand(bout.data(), alphaOut.data(), un.data(), nm);
+		for (size_t i = 0; i < nm; i++)
+			out_rgba[i * 4 + c] = un[i];
+	}
+	for (size_t i = 0; i < nm; i++)
+		out_rgba[i * 4 + 3] = alphaOut[i];
+	if (ms)
+		*ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+	return true;
+}
 } // namespace GE1Class3Filter

@@ -24,4 +24,10 @@ namespace GE1Class3Filter
 bool BuildLanczosAtlas(const std::uint8_t* stock_rgba, int w, int h, int alpha_clamp,
 	std::vector<std::uint8_t>& out_rgba, int& out_w, int& out_h, double* ms = nullptr);
 
+// One RMT9-chain mip halve of the previous level (no unsharp, no clamp);
+// out_* describe the produced level. False at 1x1 (chain end).
+bool BuildMipLevel(const std::uint8_t* prev_rgba, int w, int h,
+	std::vector<std::uint8_t>& out_rgba, int& out_w, int& out_h, double* ms = nullptr);
+
+
 } // namespace GE1Class3Filter
