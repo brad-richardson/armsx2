@@ -1293,7 +1293,9 @@ bool GSDeviceVK::CreateAllocator()
 {
 	VmaAllocatorCreateInfo ci = {};
 	ci.vulkanApiVersion = VK_API_VERSION_1_1;
-	ci.flags = VMA_ALLOCATOR_CREATE_EXTERNALLY_SYNCHRONIZED_BIT;
+	// GE1 calls VMA from several threads (GS Back + MTGS/present + HUD
+	// composite), so VMA's own mutexes must stay on (vma-race-1/odin-pb66).
+	ci.flags = 0;
 	ci.physicalDevice = m_physical_device;
 	ci.device = m_device;
 	ci.instance = m_instance;
