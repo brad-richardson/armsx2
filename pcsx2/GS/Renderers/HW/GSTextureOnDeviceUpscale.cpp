@@ -230,9 +230,10 @@ void RemoveStaleRecipeDirsLocked(const std::string& root)
 {
 	if (root.empty())
 		return;
-	// Same FindFiles call shape as TrimCacheLocked (proven): one pattern per
-	// provider-written extension, flags 0. A bare "*" listing proved
-	// unreliable here (P13 gate: listed nothing, removed 0).
+	// One pattern per provider-written extension, WITH the FILES flag:
+	// flags 0 lists nothing (neither FILES nor FOLDERS bit set), which is
+	// why the first version of this cleanup removed 0. TrimCacheLocked has
+	// the same latent flags-0 shape (dormant: its budget never fires).
 	constexpr const char* kOurs[] = {"*.png", "*.manifest", "*.tmp"};
 	for (const auto& stale : kStaleRecipeDirs)
 	{
@@ -242,7 +243,7 @@ void RemoveStaleRecipeDirsLocked(const std::string& root)
 		for (const char* pat : kOurs)
 		{
 			FileSystem::FindResultsArray files;
-			if (!FileSystem::FindFiles(dir.c_str(), pat, 0, &files, nullptr))
+			if (!FileSystem::FindFiles(dir.c_str(), pat, FILESYSTEM_FIND_FILES, &files, nullptr))
 				continue; // absent (or unreadable): nothing to do
 			present = true;
 			for (const auto& f : files)
