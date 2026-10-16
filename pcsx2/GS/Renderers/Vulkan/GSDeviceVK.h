@@ -1224,6 +1224,9 @@ private:
 	VkViewport m_viewport = {0.0f, 0.0f, 1.0f, 1.0f, 0.0f, 1.0f};
 	float m_current_line_width = 1.0f;
 	u8 m_blend_constant_color = 0;
+	// ssx3 turnip-stock-1: GE1_BLENDCONST_REEMIT=1 re-emits blend constants
+	// before every constant-blend draw (see SetBlendConstants). Default off.
+	bool m_blendconst_reemit = false;
 
 	std::array<GSTextureVK*, NUM_TFX_TEXTURES> m_tfx_textures{};
 	VkSampler m_tfx_sampler = VK_NULL_HANDLE;

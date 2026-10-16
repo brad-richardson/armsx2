@@ -4308,6 +4308,16 @@ void GSDeviceVK::ResolveFeatureTable()
 		Console.WriteLn("VK: OMS1 inv-src1 rewrite on (GE1_ADRENO_SRC1_REWRITE=1)");
 	}
 
+	// ssx3 turnip-stock-1: GE1_BLENDCONST_REEMIT=1 re-emits vkCmdSetBlendConstants
+	// before every constant-blend draw even when the value is unchanged, working
+	// around Turnip's stale static-to-dynamic blend-constant state on drivers
+	// without MR1-0003/TUR5. Default off; diagnostic knob, owner turnip-stock-1.
+	if (const char* reemit = std::getenv("GE1_BLENDCONST_REEMIT"); reemit && std::strcmp(reemit, "1") == 0)
+	{
+		m_blendconst_reemit = true;
+		Console.WriteLn("VK: turnip-stock-1 blendconst re-emit on (GE1_BLENDCONST_REEMIT=1)");
+	}
+
 	// Use D32F depth instead of D32S8 when we have framebuffer fetch.
 	m_features.stencil_buffer &= !m_features.framebuffer_fetch;
 
@@ -9928,7 +9938,13 @@ void GSDeviceVK::SetIndexBuffer(VkBuffer buffer)
 
 void GSDeviceVK::SetBlendConstants(u8 color)
 {
-	if (m_blend_constant_color == color)
+	// ssx3 turnip-stock-1: with GE1_BLENDCONST_REEMIT=1 the early-out is
+	// disabled, so every constant-blend draw re-emits vkCmdSetBlendConstants
+	// even when the value is unchanged. That forces Turnip to rebuild the
+	// blend-constant draw state from the fresh value, working around its
+	// stale static-to-dynamic inheritance (TU3 class A menu washout, Throne
+	// dark world) on drivers without MR1-0003/TUR5.
+	if (m_blend_constant_color == color && !m_blendconst_reemit)
 		return;
 
 	m_blend_constant_color = color;
@@ -10288,6 +10304,14 @@ __ri void GSDeviceVK::ApplyBaseState(u32 flags, VkCommandBuffer cmdbuf)
 	if (flags & DIRTY_FLAG_BLEND_CONSTANTS)
 	{
 		const GSVector4 col(static_cast<float>(m_blend_constant_color) / 128.0f);
+		// ssx3 turnip-stock-1 (TU3-proven): a different value first, so the
+		// driver sees a change and re-emits the constant even when it equals
+		// its cached (but stale) value.
+		if (m_blendconst_reemit)
+		{
+			const GSVector4 other(-1.0f);
+			vkCmdSetBlendConstants(cmdbuf, other.v);
+		}
 		vkCmdSetBlendConstants(cmdbuf, col.v);
 	}
 
