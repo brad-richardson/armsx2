@@ -309,9 +309,6 @@ std::string CacheKey(const RegistryRow& row, const std::string& sfn_digest)
 	       Hex8(row.suffix) + "-" + sfn_digest + "-" + row.recipe;
 }
 
-int AppendMipChain(const std::uint8_t* base_rgba, int w, int h,
-	std::vector<GSTextureReplacements::ReplacementTexture::MipData>& mips);
-
 struct BaseImage
 {
 	std::vector<std::uint8_t> rgba; // tight rows, w*h*4
@@ -469,6 +466,9 @@ int ServeImage(BaseImage& img, bool mip_chain,
 }
 
 } // namespace
+
+int AppendMipChain(const std::uint8_t* base_rgba, int w, int h,
+	std::vector<GSTextureReplacements::ReplacementTexture::MipData>& mips);
 
 void EnsureInitialized()
 {
