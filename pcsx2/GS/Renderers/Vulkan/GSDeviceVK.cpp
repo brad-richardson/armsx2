@@ -93,6 +93,9 @@ namespace
 #ifdef __ANDROID__
 #include <android/hardware_buffer.h>
 #include <vulkan/vulkan_android.h>
+// gralloc-ubwc-1 E2: dup/close (dma-buf fd), dlsym (getNativeHandle probe).
+#include <dlfcn.h>
+#include <unistd.h>
 #endif
 
 // Tweakables
@@ -546,6 +549,15 @@ bool GSDeviceVK::SelectDeviceExtensions(ExtensionList* extension_list, bool enab
 		if (!SupportsExtension(VK_ANDROID_EXTERNAL_MEMORY_ANDROID_HARDWARE_BUFFER_EXTENSION_NAME, true) ||
 			!SupportsExtension(VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME, true))
 			return false;
+		// gralloc-ubwc-1 E2: optional dma-buf + explicit-modifier import.
+		// Enabled when present; the import falls back to AHB when any is
+		// absent.
+		m_optional_extensions.vk_ext_external_memory_dma_buf =
+			SupportsExtension(VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME, false);
+		m_optional_extensions.vk_ext_image_drm_format_modifier =
+			SupportsExtension(VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME, false);
+		m_optional_extensions.vk_khr_external_memory_fd =
+			SupportsExtension(VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME, false);
 	}
 #endif
 
@@ -4882,6 +4894,253 @@ void GSDeviceVK::DoCopyRect(GSTexture* sTex, GSTexture* dTex, const GSVector4i& 
 }
 
 #ifdef __ANDROID__
+// gralloc-ubwc-1 E2: Linux drm_fourcc.h DRM_FORMAT_MOD_LINEAR. No NDK header
+// defines it; the value is 0 (fourcc_mod_code(NONE, 0)).
+#define GE1_DRM_FORMAT_MOD_LINEAR 0u
+
+// gralloc-ubwc-1 E2: minimal binary-compatible mirror of Android's
+// native_handle_t (stable ABI; cutils/native_handle.h is not in the NDK).
+// Only data[0] (the dma-buf fd) is read.
+struct GE1NativeHandle
+{
+	int version;
+	int numFds;
+	int numInts;
+	int data[];
+};
+
+bool GSDeviceVK::TryImportDmaBufLinear(
+	AHardwareBuffer* buffer, u32 width, u32 height, u32 stride_pixels, ExportImage& out)
+{
+	auto fail = [](const char* why) {
+		std::fprintf(stderr, "GE1 AHB export: dma-buf import: %s (AHB fallback next)\n", why);
+		return false;
+	};
+	if (!(m_optional_extensions.vk_ext_external_memory_dma_buf &&
+	      m_optional_extensions.vk_ext_image_drm_format_modifier &&
+	      m_optional_extensions.vk_khr_external_memory_fd))
+		return fail("dma-buf/modifier/fd extensions absent");
+	if (!stride_pixels || stride_pixels < width)
+		return fail("bad AHB stride");
+	// AHardwareBuffer_getNativeHandle is exported from libandroid but not
+	// declared by the NDK: resolve at runtime so a missing symbol falls back
+	// instead of breaking startup linking.
+	using GetNativeHandleFn = const GE1NativeHandle* (*)(const AHardwareBuffer*);
+	static auto get_handle =
+		reinterpret_cast<GetNativeHandleFn>(dlsym(RTLD_DEFAULT, "AHardwareBuffer_getNativeHandle"));
+	if (!get_handle)
+		return fail("AHardwareBuffer_getNativeHandle unavailable");
+	const GE1NativeHandle* hnd = get_handle(buffer);
+	if (!hnd || hnd->numFds < 1)
+		return fail("no dmabuf fd");
+	// The fd import consumes the fd on success (Mesa precedent:
+	// vk_android_import_anb_memory closes its dup on failure), so dup it.
+	const int dup_fd = dup(hnd->data[0]);
+	if (dup_fd < 0)
+		return fail("dup failed");
+
+	VkExternalMemoryImageCreateInfo ext = {VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO};
+	ext.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+	VkSubresourceLayout plane = {};
+	plane.offset = 0;
+	// AHardwareBuffer_Desc.stride is in pixels; RGBA8 is 4 bytes (the RGBA8
+	// format is gated by the caller).
+	plane.rowPitch = static_cast<VkDeviceSize>(stride_pixels) * 4;
+	VkImageDrmFormatModifierExplicitCreateInfoEXT mod = {
+		VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT};
+	mod.drmFormatModifier = GE1_DRM_FORMAT_MOD_LINEAR;
+	mod.drmFormatModifierPlaneCount = 1;
+	mod.pPlaneLayouts = &plane;
+	ext.pNext = &mod;
+	VkImageCreateInfo ii = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, &ext};
+	ii.imageType = VK_IMAGE_TYPE_2D;
+	ii.format = VK_FORMAT_R8G8B8A8_UNORM;
+	ii.extent = {width, height, 1};
+	ii.mipLevels = 1;
+	ii.arrayLayers = 1;
+	ii.samples = VK_SAMPLE_COUNT_1_BIT;
+	ii.tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
+	// Same usage as the AHB path (STORAGE for the Tricky HUD compute
+	// composite); LINEAR RGBA8 keeps depth-free optimal features incl.
+	// storage on Turnip.
+	ii.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+	           VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
+	ii.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+	VkImage image = VK_NULL_HANDLE;
+	if (vkCreateImage(m_device, &ii, nullptr, &image) != VK_SUCCESS)
+	{
+		close(dup_fd);
+		return fail("vkCreateImage failed");
+	}
+	auto get_fd_props = reinterpret_cast<PFN_vkGetMemoryFdPropertiesKHR>(
+		vkGetDeviceProcAddr(m_device, "vkGetMemoryFdPropertiesKHR"));
+	if (!get_fd_props)
+	{
+		close(dup_fd);
+		vkDestroyImage(m_device, image, nullptr);
+		return fail("vkGetMemoryFdPropertiesKHR unavailable");
+	}
+	VkMemoryFdPropertiesKHR fd_props = {VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR};
+	if (get_fd_props(m_device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, dup_fd, &fd_props) !=
+		VK_SUCCESS)
+	{
+		close(dup_fd);
+		vkDestroyImage(m_device, image, nullptr);
+		return fail("vkGetMemoryFdPropertiesKHR failed");
+	}
+	VkMemoryRequirements reqs = {};
+	vkGetImageMemoryRequirements(m_device, image, &reqs);
+	const u32 compat = reqs.memoryTypeBits & fd_props.memoryTypeBits;
+	if (!compat)
+	{
+		close(dup_fd);
+		vkDestroyImage(m_device, image, nullptr);
+		return fail("no compatible AHB memory type");
+	}
+	VkImportMemoryFdInfoKHR imp = {VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR};
+	imp.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+	imp.fd = dup_fd;
+	VkMemoryDedicatedAllocateInfo dedicated = {VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO, &imp};
+	dedicated.image = image;
+	VkMemoryAllocateInfo mai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &dedicated};
+	mai.allocationSize = reqs.size;
+	mai.memoryTypeIndex = static_cast<u32>(__builtin_ctz(compat));
+	VkDeviceMemory memory = VK_NULL_HANDLE;
+	if (vkAllocateMemory(m_device, &mai, nullptr, &memory) != VK_SUCCESS ||
+		vkBindImageMemory(m_device, image, memory, 0) != VK_SUCCESS)
+	{
+		close(dup_fd);
+		if (memory)
+			vkFreeMemory(m_device, memory, nullptr);
+		vkDestroyImage(m_device, image, nullptr);
+		return fail("dma-buf memory allocation or bind failed");
+	}
+	// dup_fd is owned by the driver from here on.
+	auto get_mod_props = reinterpret_cast<PFN_vkGetImageDrmFormatModifierPropertiesEXT>(
+		vkGetDeviceProcAddr(m_device, "vkGetImageDrmFormatModifierPropertiesEXT"));
+	if (get_mod_props)
+	{
+		VkImageDrmFormatModifierPropertiesEXT mp = {
+			VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_PROPERTIES_EXT};
+		if (get_mod_props(m_device, image, &mp) == VK_SUCCESS)
+		{
+			static bool logged = false;
+			if (!logged)
+			{
+				logged = true;
+				std::fprintf(stderr, "GE1 AHB export: dma-buf LINEAR import ok (modifier=0x%llx)\n",
+					static_cast<unsigned long long>(mp.drmFormatModifier));
+			}
+			if (mp.drmFormatModifier != GE1_DRM_FORMAT_MOD_LINEAR)
+			{
+				vkFreeMemory(m_device, memory, nullptr);
+				vkDestroyImage(m_device, image, nullptr);
+				return fail("bound modifier is not LINEAR");
+			}
+		}
+	}
+	out.image = image;
+	out.memory = memory;
+	out.width = width;
+	out.height = height;
+	return true;
+}
+
+// gralloc-ubwc-1 E2 safety net (one-time boot self-test): GPU-clear the
+// imported image to an exact pattern on an isolated command buffer, wait,
+// CPU-lock the AHB and check five pixels. Only an exact LINEAR
+// interpretation reads the pattern back; anything else (e.g. a tiled
+// misimport) fails and the caller switches to the readback fallback.
+bool GSDeviceVK::SelfTestDmaBufLinear(
+	AHardwareBuffer* buffer, u32 width, u32 height, u32 stride_pixels, VkImage image)
+{
+	auto fail = [](const char* why) {
+		std::fprintf(stderr, "GE1 AHB export: dma-buf self-test: %s\n", why);
+		return false;
+	};
+	VkCommandPool pool = VK_NULL_HANDLE;
+	VkCommandPoolCreateInfo pci = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+	pci.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+	pci.queueFamilyIndex = m_graphics_queue_family_index;
+	if (vkCreateCommandPool(m_device, &pci, nullptr, &pool) != VK_SUCCESS)
+		return fail("command pool failed");
+	VkCommandBuffer cb = VK_NULL_HANDLE;
+	VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+	ai.commandPool = pool;
+	ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+	ai.commandBufferCount = 1;
+	if (vkAllocateCommandBuffers(m_device, &ai, &cb) != VK_SUCCESS)
+	{
+		vkDestroyCommandPool(m_device, pool, nullptr);
+		return fail("command buffer failed");
+	}
+	VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+	bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+	bool ok = vkBeginCommandBuffer(cb, &bi) == VK_SUCCESS;
+	VkImageMemoryBarrier to_dst = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+	to_dst.srcAccessMask = 0;
+	to_dst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+	to_dst.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+	to_dst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+	to_dst.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	to_dst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	to_dst.image = image;
+	to_dst.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+	if (ok)
+		vkCmdPipelineBarrier(
+			cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &to_dst);
+	// Exact bytes 0xFF0000FF (R8G8B8A8): float (1,0,0,1) converts exactly.
+	const VkClearColorValue red = {{1.0f, 0.0f, 0.0f, 1.0f}};
+	if (ok)
+		vkCmdClearColorImage(cb, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &red, 1, &to_dst.subresourceRange);
+	VkImageMemoryBarrier to_general = to_dst;
+	to_general.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+	to_general.dstAccessMask = 0;
+	to_general.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+	to_general.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+	if (ok)
+		vkCmdPipelineBarrier(
+			cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, nullptr, 0, nullptr, 1, &to_general);
+	if (ok)
+		ok = vkEndCommandBuffer(cb) == VK_SUCCESS;
+	VkFence fence = VK_NULL_HANDLE;
+	VkFenceCreateInfo fi = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+	if (ok)
+		ok = vkCreateFence(m_device, &fi, nullptr, &fence) == VK_SUCCESS;
+	VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
+	si.commandBufferCount = 1;
+	si.pCommandBuffers = &cb;
+	if (ok)
+		ok = vkQueueSubmit(m_graphics_queue, 1, &si, fence) == VK_SUCCESS;
+	if (ok)
+		ok = vkWaitForFences(m_device, 1, &fence, VK_TRUE, 5000000000ull) == VK_SUCCESS;
+	if (fence)
+		vkDestroyFence(m_device, fence, nullptr);
+	vkDestroyCommandPool(m_device, pool, nullptr);
+	if (!ok)
+		return fail("GPU clear failed");
+	// CPU_READ_RARELY is in the AHB allocation usage; fence -1, whole buffer.
+	void* ptr = nullptr;
+	if (AHardwareBuffer_lock(buffer, AHARDWAREBUFFER_USAGE_CPU_READ_RARELY, -1, nullptr, &ptr) != 0 || !ptr)
+		return fail("AHB lock failed");
+	const u32 pitch = stride_pixels * 4;
+	const u8* px = static_cast<const u8*>(ptr);
+	auto at = [&](u32 x, u32 y) { return px + static_cast<size_t>(y) * pitch + static_cast<size_t>(x) * 4; };
+	const u32 xs[5] = {0, width - 1, width / 2, 0, width - 1};
+	const u32 ys[5] = {0, 0, height / 2, height - 1, height - 1};
+	bool match = true;
+	for (int i = 0; i < 5 && match; i++)
+	{
+		const u8* p = at(xs[i], ys[i]);
+		match = (p[0] == 0xFF && p[1] == 0x00 && p[2] == 0x00 && p[3] == 0xFF);
+	}
+	AHardwareBuffer_unlock(buffer, nullptr);
+	if (!match)
+		return fail("pattern mismatch (non-LINEAR interpretation)");
+	std::fprintf(stderr, "GE1 AHB export: dma-buf self-test passed (LINEAR confirmed)\n");
+	return true;
+}
+
 GSDeviceVK::ExportImage* GSDeviceVK::FindOrImportAHBImage(
 	AHardwareBuffer* buffer, u32 width, u32 height)
 {
@@ -4900,8 +5159,43 @@ GSDeviceVK::ExportImage* GSDeviceVK::FindOrImportAHBImage(
 		std::lock_guard<std::mutex> map_lock(m_submit_mutex);
 		found = m_export_images.find(buffer);
 	}
+	if (m_ahb_import_disabled.load())
+		return fail("AHB import disabled by dma-buf self-test (readback fallback)");
 	if (found == m_export_images.end())
 	{
+		ExportImage image;
+		image.width = width;
+		image.height = height;
+		// gralloc-ubwc-1 E2: try the dma-buf + explicit-LINEAR import first;
+		// any failure falls through to the AHB import below.
+		bool use_ahb = true;
+		if (TryImportDmaBufLinear(buffer, width, height, static_cast<u32>(desc.stride), image))
+		{
+			use_ahb = false;
+			bool expected = false;
+			if (m_dmabuf_selftest_done.compare_exchange_strong(expected, true) &&
+				!SelfTestDmaBufLinear(buffer, width, height, static_cast<u32>(desc.stride), image.image))
+			{
+				vkFreeMemory(m_device, image.memory, nullptr);
+				vkDestroyImage(m_device, image.image, nullptr);
+				m_ahb_import_disabled.store(true);
+				return fail("dma-buf self-test failed, AHB import disabled (readback fallback)");
+			}
+			static bool logged_dmabuf = false;
+			if (!logged_dmabuf)
+			{
+				logged_dmabuf = true;
+				std::fprintf(stderr, "GE1 AHB export: using dma-buf LINEAR import\n");
+			}
+		}
+		if (use_ahb)
+		{
+		static bool logged_ahb = false;
+		if (!logged_ahb)
+		{
+			logged_ahb = true;
+			std::fprintf(stderr, "GE1 AHB export: using AHB import fallback\n");
+		}
 		auto get_props = reinterpret_cast<PFN_vkGetAndroidHardwareBufferPropertiesANDROID>(
 			vkGetDeviceProcAddr(m_device, "vkGetAndroidHardwareBufferPropertiesANDROID"));
 		if (!get_props)
@@ -4913,9 +5207,6 @@ GSDeviceVK::ExportImage* GSDeviceVK::FindOrImportAHBImage(
 		if (get_props(m_device, buffer, &props) != VK_SUCCESS || !props.memoryTypeBits ||
 			format.format != VK_FORMAT_R8G8B8A8_UNORM)
 			return fail("AHB Vulkan properties or RGBA8 format mismatch");
-		ExportImage image;
-		image.width = width;
-		image.height = height;
 		VkExternalMemoryImageCreateInfo ext = {VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO};
 		ext.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID;
 		VkImageCreateInfo ii = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, &ext};
@@ -4948,6 +5239,7 @@ GSDeviceVK::ExportImage* GSDeviceVK::FindOrImportAHBImage(
 			vkDestroyImage(m_device, image.image, nullptr);
 			return fail("AHB memory allocation or bind failed");
 		}
+		} // if (use_ahb): AHB import fallback
 		{
 			std::lock_guard<std::mutex> map_lock(m_submit_mutex);
 			found = m_export_images.emplace(buffer, std::move(image)).first;

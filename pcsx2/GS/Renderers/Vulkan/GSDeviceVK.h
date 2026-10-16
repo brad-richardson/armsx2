@@ -74,6 +74,12 @@ public:
 		/// only while GSConfig.LsfgFp16 is on, so nobody else's device changes.
 		bool vk_khr_shader_float16_int8 : 1;
 		bool vk_ext_device_fault : 1;
+		/// gralloc-ubwc-1 E2: dma-buf + explicit-LINEAR AHB import. Enabled
+		/// when present; the import falls back to the AHB path when any is
+		/// absent (Android-only feature; inert everywhere else).
+		bool vk_ext_external_memory_dma_buf : 1;
+		bool vk_ext_image_drm_format_modifier : 1;
+		bool vk_khr_external_memory_fd : 1;
 	};
 
 	// Global state accessors
@@ -281,6 +287,19 @@ private:
 	};
 	std::unordered_map<AHardwareBuffer*, ExportImage> m_export_images;
 	ExportImage* FindOrImportAHBImage(AHardwareBuffer* buffer, u32 width, u32 height);
+	// gralloc-ubwc-1 E2: dma-buf + explicit-LINEAR import attempt (true =
+	// image/memory filled, fd consumed by the driver). Any failure means
+	// "use the AHB import below". stride_pixels is the AHB desc stride.
+	bool TryImportDmaBufLinear(
+		AHardwareBuffer* buffer, u32 width, u32 height, u32 stride_pixels, ExportImage& out);
+	// gralloc-ubwc-1 E2 safety net: GPU-clear to a pattern, CPU-lock, check
+	// pixels. True = LINEAR interpretation confirmed.
+	bool SelfTestDmaBufLinear(
+		AHardwareBuffer* buffer, u32 width, u32 height, u32 stride_pixels, VkImage image);
+	// gralloc-ubwc-1 E2: sticky self-test failure. Once set, every import
+	// returns nullptr so the caller uses the readback fallback.
+	std::atomic<bool> m_ahb_import_disabled{false};
+	std::atomic<bool> m_dmabuf_selftest_done{false};
 	// HUD4: Tricky HUD composite state (all device-lifetime; the pool holds ≤8 sets, HPR1).
 	VkPipeline m_hud_pipeline = VK_NULL_HANDLE;
 	VkPipelineLayout m_hud_pipeline_layout = VK_NULL_HANDLE;
