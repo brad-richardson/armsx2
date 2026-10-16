@@ -409,4 +409,39 @@ bool BuildMipLevel(const std::uint8_t* prev_rgba, int w, int h,
 		*ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 	return true;
 }
+
+bool PillowResizeRGBA(const std::uint8_t* in_rgba, int w, int h,
+	std::vector<std::uint8_t>& out_rgba, int W, int H, double* ms)
+{
+	if (!in_rgba || w <= 0 || h <= 0 || W <= 0 || H <= 0)
+		return false;
+	const auto t0 = std::chrono::steady_clock::now();
+	const size_t n = static_cast<size_t>(w) * h;
+	const size_t nm = static_cast<size_t>(W) * H;
+
+	// Same RGBA semantics as BuildMipLevel (Pillow RGBA resize): premultiply
+	// (round half-up), Pillow-resize, unpremultiply (truncate, clip). Alpha
+	// resizes straight.
+	std::vector<std::uint8_t> band(n), prem(n), bout(nm), alpha(n), alphaOut(nm);
+	for (size_t i = 0; i < n; i++)
+		alpha[i] = in_rgba[i * 4 + 3];
+	PillowResizeBand(alpha.data(), w, h, alphaOut.data(), W, H);
+	out_rgba.resize(nm * 4);
+	for (int c = 0; c < 3; c++)
+	{
+		for (size_t i = 0; i < n; i++)
+			band[i] = in_rgba[i * 4 + c];
+		PremultBand(band.data(), alpha.data(), prem.data(), n);
+		PillowResizeBand(prem.data(), w, h, bout.data(), W, H);
+		std::vector<std::uint8_t> un(nm);
+		UnpremultBand(bout.data(), alphaOut.data(), un.data(), nm);
+		for (size_t i = 0; i < nm; i++)
+			out_rgba[i * 4 + c] = un[i];
+	}
+	for (size_t i = 0; i < nm; i++)
+		out_rgba[i * 4 + 3] = alphaOut[i];
+	if (ms)
+		*ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+	return true;
+}
 } // namespace GE1Class3Filter

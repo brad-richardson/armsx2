@@ -9,8 +9,10 @@
 #include "common/Path.h"
 #include "common/SHA256.h"
 #include "pcsx2/Config.h"
+#include "GS/GS.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -39,6 +41,11 @@ struct RegistryRow
 };
 
 constexpr char kRecipeWords[] = "raster-edge-v1";
+// Prescale cache namespace: the 4x bytes resampled to the render scale.
+// Keyed per (texture, target dims), so a scale change misses and rebuilds
+// from the shared 4x bytes instead of serving stale-scale pixels.
+constexpr char kRecipeWordsPrescale[] = "raster-edge-prescale-v1";
+constexpr char kPrescaleGroup[] = "words-prescale-v1";
 // v2: faithful Pillow port (premult round-half-up, Resample.c fixed-point,
 // BoxBlur.c UnsharpMask). v1 cache dirs go stale and are LRU-trimmed.
 constexpr char kRecipeArt[] = "lanczos-a-v2";
@@ -140,6 +147,7 @@ std::mutex s_lock;
 std::once_flag s_init_once;
 bool s_initialized = false;
 bool s_enabled = false;
+bool s_prescale = false;
 unsigned s_generation = 0;
 unsigned s_applied_seq = 0;
 SfnStore s_sfn[2]; // [0] atlas 2, [1] atlas 72
@@ -301,6 +309,162 @@ std::string CacheKey(const RegistryRow& row, const std::string& sfn_digest)
 	       Hex8(row.suffix) + "-" + sfn_digest + "-" + row.recipe;
 }
 
+struct BaseImage
+{
+	std::vector<std::uint8_t> rgba; // tight rows, w*h*4
+	int w = 0, h = 0;
+};
+
+// Validated PNG load into tight rows. Same admission as the old warm path
+// (Color format, exact dims, non-empty); the pitch guard keeps the tighten
+// memcpy in-bounds if a loader ever pads rows.
+bool LoadCachedImage(const std::string& png_path, int expect_w, int expect_h, BaseImage& base)
+{
+	GSTextureReplacements::ReplacementTextureLoader loader =
+		GSTextureReplacements::GetLoader(png_path);
+	GSTextureReplacements::ReplacementTexture cached;
+	if (!loader || !loader(png_path, &cached, true) ||
+		cached.format != GSTexture::Format::Color ||
+		cached.width != static_cast<std::uint32_t>(expect_w) ||
+		cached.height != static_cast<std::uint32_t>(expect_h) || cached.data.empty() ||
+		cached.pitch < cached.width * 4)
+		return false;
+	base.rgba.resize(static_cast<std::size_t>(expect_w) * expect_h * 4);
+	for (int yy = 0; yy < expect_h; yy++)
+	{
+		std::memcpy(base.rgba.data() + static_cast<std::size_t>(yy) * expect_w * 4,
+			cached.data.data() + static_cast<std::size_t>(yy) * cached.pitch,
+			static_cast<std::size_t>(expect_w) * 4);
+	}
+	base.w = expect_w;
+	base.h = expect_h;
+	return true;
+}
+
+// Cold 4x generation for one registry row: shared decode primitive, recipe
+// filter, private 4x cache write. Art and words rows both land here, so the
+// shipped 4x path and the prescale base share bytes. reason: 0 ok, 1 decode
+// fail, 2 geometry fail (callers map to skipped_decode/skipped_geometry).
+bool GenerateBase4x(const RegistryRow& row, const SfnStore* sfn, const GIFRegTEX0& TEX0,
+	const GIFRegTEXA& TEXA, GSTextureCache::SourceRegion region, GSLocalMemory& mem,
+	const std::string& dir, const std::string& ckey, const std::string& sfn_digest, bool cache_on,
+	BaseImage& base, GE1FontFilter::Stats& fstat, int& reason)
+{
+	reason = 1;
+	bool decoded = false;
+	std::vector<std::uint8_t> tight;
+	std::uint32_t dw = 0, dh = 0;
+	const bool ok = GSTextureReplacements::WithDecodedSourceLevel(
+		TEX0, TEXA, region, mem,
+		[&](const std::uint8_t* pixels, std::uint32_t w, std::uint32_t h, std::uint32_t pitch) {
+			if (w != row.expect_w || h != row.expect_h)
+				return false;
+			tight.resize(static_cast<std::size_t>(w) * h * 4);
+			for (std::uint32_t yy = 0; yy < h; yy++)
+			{
+				std::memcpy(tight.data() + static_cast<std::size_t>(yy) * w * 4,
+					pixels + static_cast<std::size_t>(yy) * pitch, static_cast<std::size_t>(w) * 4);
+			}
+			dw = w;
+			dh = h;
+			decoded = true;
+			return true;
+		});
+	if (!ok || !decoded)
+		return false;
+	if (dw != row.expect_w || dh != row.expect_h)
+	{
+		reason = 2;
+		return false;
+	}
+
+	std::vector<std::uint8_t> out_rgba;
+	int ow = 0, oh = 0;
+	bool built = false;
+	if (std::strcmp(row.recipe, kRecipeArt) == 0)
+	{
+		double art_ms = 0.0;
+		built = GE1Class3Filter::BuildLanczosAtlas(tight.data(), static_cast<int>(dw), static_cast<int>(dh),
+			row.alpha_clamp, out_rgba, ow, oh, &art_ms);
+		fstat.ms = art_ms;
+	}
+	else
+	{
+		const GE1FontFilter::SfnRow* sfn_rows = sfn ? sfn->rows.data() : nullptr;
+		const int sfn_n = sfn ? static_cast<int>(sfn->rows.size()) : 0;
+		built = GE1FontFilter::BuildFontAtlas(row.atlas, tight.data(), static_cast<int>(dw), static_cast<int>(dh),
+			sfn_rows, sfn_n, out_rgba, ow, oh, &fstat);
+	}
+	if (!built)
+	{
+		reason = 2;
+		return false;
+	}
+
+	// Persist privately (temp + rename, manifest last); loss is normal.
+	// Written with the platform zlib: decode-equal to the oracle's PNGs
+	// everywhere, byte-equal where the compressor matches (Mac harness
+	// proves byte-equality against zlib-ng 1.3.1).
+	if (cache_on)
+	{
+		const std::string png_path = Path::Combine(dir, ckey + ".png");
+		const std::string man_path = Path::Combine(dir, ckey + ".manifest");
+		Error err;
+		FileSystem::CreateDirectoryPath(dir.c_str(), true, &err);
+		const std::string tmp_png = png_path + ".tmp";
+		if (GE1FontFilter::WriteFontPNG(tmp_png, out_rgba.data(), ow, oh) &&
+			FileSystem::RenamePath(tmp_png.c_str(), png_path.c_str(), nullptr))
+		{
+			char man[256];
+			std::snprintf(man, sizeof(man),
+				"ondevice-upscale-manifest-v1\nrecipe=%s sharp=1.0 thresh=64 mode=smoothstep\n"
+				"tex0=%s clut=%s suffix=%s\nsfn=%s\ndims=%ux%u\n",
+				row.recipe, Hex16(row.tex0hash).c_str(), Hex16(row.cluthash).c_str(),
+				Hex8(row.suffix).c_str(), sfn_digest.c_str(), static_cast<unsigned>(ow),
+				static_cast<unsigned>(oh));
+			const std::string tmp_man = man_path + ".tmp";
+			WriteFileAtomic(tmp_man, reinterpret_cast<const std::uint8_t*>(man), std::strlen(man));
+			FileSystem::RenamePath(tmp_man.c_str(), man_path.c_str(), nullptr);
+			TrimCacheLocked(dir);
+		}
+	}
+
+	reason = 0;
+	base.rgba = std::move(out_rgba);
+	base.w = ow;
+	base.h = oh;
+	return true;
+}
+
+// Upload-shape fill from tight rows: alpha bounds from the actual pixels
+// (same policy as packs), Color (RGBA8) like the pack PNG loader produces,
+// RMT9 chain only for mip_chain rows. Returns the chain length (0 none).
+int ServeImage(BaseImage& img, bool mip_chain,
+	GSTextureReplacements::ReplacementTexture& out, std::pair<std::uint8_t, std::uint8_t>* alpha_minmax)
+{
+	unsigned lo = 255, hi = 0;
+	for (std::size_t i = 3; i < img.rgba.size(); i += 4)
+	{
+		lo = img.rgba[i] < lo ? img.rgba[i] : lo;
+		hi = img.rgba[i] > hi ? img.rgba[i] : hi;
+	}
+	*alpha_minmax = {static_cast<std::uint8_t>(lo), static_cast<std::uint8_t>(hi)};
+	out.width = static_cast<std::uint32_t>(img.w);
+	out.height = static_cast<std::uint32_t>(img.h);
+	// Color (RGBA8) like the pack PNG loader produces, not UNorm8 (A8).
+	out.format = GSTexture::Format::Color;
+	out.alpha_minmax = *alpha_minmax;
+	out.pitch = static_cast<std::uint32_t>(img.w) * 4;
+	out.data.assign(img.rgba.begin(), img.rgba.end());
+	if (mip_chain)
+	{
+		const int levels = AppendMipChain(img.rgba.data(), img.w, img.h, out.mips);
+		out.generated = true;
+		return levels;
+	}
+	return 0;
+}
+
 } // namespace
 
 void EnsureInitialized()
@@ -316,6 +480,10 @@ void InitializeFromEnvironment()
 	s_initialized = true;
 	const char* e = std::getenv("GE1_ONDEVICE_UPSCALE");
 	s_enabled = (e && std::strcmp(e, "1") == 0);
+	// Prescale is init-time only (default off): the lookup path never polls
+	// getenv, and GPU entries are per-boot, so no live purge is needed.
+	const char* pre = std::getenv("GE1_ONDEVICE_UPSCALE_PRESCALE");
+	s_prescale = (pre && std::strcmp(pre, "1") == 0);
 	if (s_enabled)
 		s_generation = 1;
 	const char* sfn_dir = std::getenv("GE1_ONDEVICE_SFN_DIR");
@@ -339,8 +507,8 @@ void InitializeFromEnvironment()
 		}
 	}
 	RemoveStaleRecipeDirsLocked(CacheRootLocked());
-	Console.WriteLn("ODU: on-device upscale %s (sfn %d/2, cache %s).", s_enabled ? "ON" : "off", loaded,
-		CacheRootLocked().c_str());
+	Console.WriteLn("ODU: on-device upscale %s prescale %s (sfn %d/2, cache %s).", s_enabled ? "ON" : "off",
+		s_prescale ? "ON" : "off", loaded, CacheRootLocked().c_str());
 }
 
 void ApplyOnDeviceUpscale(bool enabled, unsigned sequence)
@@ -367,6 +535,36 @@ unsigned Generation()
 {
 	std::unique_lock<std::mutex> lock(s_lock);
 	return s_generation;
+}
+
+bool PrescaleEnabled()
+{
+	EnsureInitialized();
+	std::unique_lock<std::mutex> lock(s_lock);
+	return s_prescale;
+}
+
+// Render-scale target for a words row (stock dims x live UpscaleMultiplier,
+// rounded like the Part 2 PRE arm: 617 px @2.41 for 256 px, 512 px @2x).
+// False when prescale is off, the row is not a words row, the scale is
+// unusable, or the scale is an integer >= 4 (the 4x base minifies cleanly).
+// Call with s_lock held (reads s_prescale); GSConfig is read lock-free.
+bool PrescaleTargetLocked(const RegistryRow& row, int& W, int& H, float& scale)
+{
+	if (!s_prescale || std::strcmp(row.recipe, kRecipeWords) != 0)
+		return false;
+	const float s = GSConfig.UpscaleMultiplier;
+	if (!(s > 0.0f))
+		return false;
+	const float r = std::round(s);
+	if (r == s && r >= 4.0f)
+		return false;
+	W = static_cast<int>(std::lrint(static_cast<double>(row.expect_w) * s));
+	H = static_cast<int>(std::lrint(static_cast<double>(row.expect_h) * s));
+	if (W <= 0 || H <= 0)
+		return false;
+	scale = s;
+	return true;
 }
 
 bool SetSfnData(int atlas, const std::uint8_t* data, std::size_t len)
@@ -497,164 +695,150 @@ bool LookupGenerated(const GSTextureCache::HashCacheKey& key, const GIFRegTEX0& 
 	const std::string ckey = CacheKey(*row, sfn_digest);
 	const std::string png_path = cache_on ? Path::Combine(dir, ckey + ".png") : std::string();
 	const std::string man_path = cache_on ? Path::Combine(dir, ckey + ".manifest") : std::string();
+	int pre_w = 0, pre_h = 0;
+	float pre_scale = 0.0f;
+	const bool want_prescale = PrescaleTargetLocked(*row, pre_w, pre_h, pre_scale);
 	lock.unlock();
 
-	// Warm path: validated disk cache first (no recomputation, no reboot).
-	if (cache_on && FileSystem::FileExists(png_path.c_str()) && FileSystem::FileExists(man_path.c_str()))
+	// Prescale path (words rows only): serve the 4x bytes Lanczos-resampled
+	// to the live render scale, cached per (texture, scale). A scale change
+	// misses the prescale file and rebuilds from the shared 4x bytes, so
+	// stale-scale pixels are never served.
+	if (want_prescale)
 	{
-		GSTextureReplacements::ReplacementTextureLoader loader =
-			GSTextureReplacements::GetLoader(png_path);
-		GSTextureReplacements::ReplacementTexture cached;
-		if (loader && loader(png_path, &cached, true) && cached.format == GSTexture::Format::Color &&
-			cached.width == row->expect_w * 4 && cached.height == row->expect_h * 4 && !cached.data.empty())
+		const std::string pdir =
+			cache_on ? Path::Combine(Path::Combine(root, sfn_digest), kPrescaleGroup) : std::string();
+		const std::string pkey =
+			ckey + "-pre" + std::to_string(pre_w) + "x" + std::to_string(pre_h);
+		const std::string pre_png = cache_on ? Path::Combine(pdir, pkey + ".png") : std::string();
+		const std::string pre_man = cache_on ? Path::Combine(pdir, pkey + ".manifest") : std::string();
+		BaseImage pre;
+		if (cache_on && FileSystem::FileExists(pre_png.c_str()) && FileSystem::FileExists(pre_man.c_str()) &&
+			LoadCachedImage(pre_png, pre_w, pre_h, pre))
 		{
-			// Alpha bounds from the actual pixels (same policy as packs).
-			unsigned lo = 255, hi = 0;
-			const std::uint8_t* px = cached.data.data();
-			for (std::uint32_t yy = 0; yy < cached.height; yy++)
-			{
-				for (std::uint32_t xx = 0; xx < cached.width; xx++)
-				{
-					const unsigned a = px[static_cast<std::size_t>(yy) * cached.pitch + static_cast<std::size_t>(xx) * 4 + 3];
-					lo = a < lo ? a : lo;
-					hi = a > hi ? a : hi;
-				}
-			}
-			*alpha_minmax = {static_cast<std::uint8_t>(lo), static_cast<std::uint8_t>(hi)};
-			out = std::move(cached);
-			int warm_levels = 0;
-			if (row->mip_chain)
-			{
-				warm_levels = AppendMipChain(out.data.data(), static_cast<int>(out.width),
-					static_cast<int>(out.height), out.mips);
-				out.generated = true;
-			}
+			ServeImage(pre, false, out, alpha_minmax);
 			lock.lock();
-			s_stats.cache_hits++;
+			s_stats.prescale_hits++;
 			lock.unlock();
-			Console.WriteLn("ODU: cache hit atlas %d (%ux%u, mips=%d).", row->atlas, out.width, out.height,
-				warm_levels);
+			Console.WriteLn("ODU: prescale hit atlas %d (%dx%d, scale %.4f).", row->atlas, pre_w, pre_h,
+				static_cast<double>(pre_scale));
 			return true;
 		}
+		if (cache_on && (FileSystem::FileExists(pre_png.c_str()) || FileSystem::FileExists(pre_man.c_str())))
+		{
+			lock.lock();
+			s_stats.cache_corrupt++;
+			lock.unlock();
+		}
+		// Base 4x: shared file first, else generate (persisting the 4x).
+		BaseImage base;
+		const int bw = static_cast<int>(row->expect_w) * 4, bh = static_cast<int>(row->expect_h) * 4;
+		bool have_base = cache_on && LoadCachedImage(png_path, bw, bh, base);
+		GE1FontFilter::Stats fstat;
+		if (!have_base)
+		{
+			int reason = 1;
+			have_base = GenerateBase4x(*row, sfn, TEX0, TEXA, region, mem, dir, ckey, sfn_digest,
+				cache_on, base, fstat, reason);
+			if (!have_base)
+			{
+				lock.lock();
+				if (reason == 2)
+					s_stats.skipped_geometry++;
+				else
+					s_stats.skipped_decode++;
+				lock.unlock();
+				return false;
+			}
+		}
+		double rms = 0.0;
+		BaseImage scaled;
+		if (!GE1Class3Filter::PillowResizeRGBA(base.rgba.data(), base.w, base.h, scaled.rgba, pre_w,
+				pre_h, &rms))
+			return false;
+		scaled.w = pre_w;
+		scaled.h = pre_h;
+		std::uint64_t pre_bytes = 0;
+		if (cache_on)
+		{
+			Error err;
+			FileSystem::CreateDirectoryPath(pdir.c_str(), true, &err);
+			const std::string tmp_png = pre_png + ".tmp";
+			if (GE1FontFilter::WriteFontPNG(tmp_png, scaled.rgba.data(), pre_w, pre_h) &&
+				FileSystem::RenamePath(tmp_png.c_str(), pre_png.c_str(), nullptr))
+			{
+				char man[384];
+				std::snprintf(man, sizeof(man),
+					"ondevice-upscale-manifest-v1\nrecipe=%s sharp=1.0 thresh=64 mode=smoothstep\n"
+					"tex0=%s clut=%s suffix=%s\nsfn=%s\nscale=%.4f\ndims=%dx%d\n",
+					kRecipeWordsPrescale, Hex16(row->tex0hash).c_str(), Hex16(row->cluthash).c_str(),
+					Hex8(row->suffix).c_str(), sfn_digest.c_str(), static_cast<double>(pre_scale),
+					pre_w, pre_h);
+				const std::string tmp_man = pre_man + ".tmp";
+				WriteFileAtomic(tmp_man, reinterpret_cast<const std::uint8_t*>(man), std::strlen(man));
+				FileSystem::RenamePath(tmp_man.c_str(), pre_man.c_str(), nullptr);
+				TrimCacheLocked(pdir);
+				std::vector<std::uint8_t> probe;
+				if (ReadFile(pre_png, probe))
+					pre_bytes = probe.size();
+			}
+		}
+		ServeImage(scaled, false, out, alpha_minmax);
 		lock.lock();
-		s_stats.cache_corrupt++;
+		s_stats.prescale_generated++;
 		lock.unlock();
+		Console.WriteLn("ODU: prescaled atlas %d (%dx%d -> %dx%d, scale %.4f, %.1f ms, %llu bytes).",
+			row->atlas, base.w, base.h, pre_w, pre_h, static_cast<double>(pre_scale), rms,
+			static_cast<unsigned long long>(pre_bytes));
+		return true;
+	}
+
+	// 4x path: validated disk cache first (no recomputation, no reboot).
+	BaseImage base;
+	bool warm = false;
+	if (cache_on && FileSystem::FileExists(png_path.c_str()) && FileSystem::FileExists(man_path.c_str()))
+	{
+		const int bw = static_cast<int>(row->expect_w) * 4, bh = static_cast<int>(row->expect_h) * 4;
+		if (LoadCachedImage(png_path, bw, bh, base))
+			warm = true;
+		else
+		{
+			lock.lock();
+			s_stats.cache_corrupt++;
+			lock.unlock();
+		}
+	}
+	if (warm)
+	{
+		const int warm_levels = ServeImage(base, row->mip_chain, out, alpha_minmax);
+		lock.lock();
+		s_stats.cache_hits++;
+		lock.unlock();
+		Console.WriteLn("ODU: cache hit atlas %d (%ux%u, mips=%d).", row->atlas, out.width, out.height,
+			warm_levels);
+		return true;
 	}
 
 	// Cold path: decode the guest level with the shared primitive, filter.
-	bool decoded = false;
-	std::vector<std::uint8_t> tight;
-	std::uint32_t dw = 0, dh = 0;
-	const bool ok = GSTextureReplacements::WithDecodedSourceLevel(
-		TEX0, TEXA, region, mem,
-		[&](const std::uint8_t* pixels, std::uint32_t w, std::uint32_t h, std::uint32_t pitch) {
-			if (w != row->expect_w || h != row->expect_h)
-				return false;
-			tight.resize(static_cast<std::size_t>(w) * h * 4);
-			for (std::uint32_t yy = 0; yy < h; yy++)
-			{
-				std::memcpy(tight.data() + static_cast<std::size_t>(yy) * w * 4,
-					pixels + static_cast<std::size_t>(yy) * pitch, static_cast<std::size_t>(w) * 4);
-			}
-			dw = w;
-			dh = h;
-			decoded = true;
-			return true;
-		});
-	if (!ok || !decoded)
-	{
-		lock.lock();
-		s_stats.skipped_decode++;
-		lock.unlock();
-		return false;
-	}
-	if (dw != row->expect_w || dh != row->expect_h)
-	{
-		lock.lock();
-		s_stats.skipped_geometry++;
-		lock.unlock();
-		return false;
-	}
-
-	std::vector<std::uint8_t> out_rgba;
-	int ow = 0, oh = 0;
 	GE1FontFilter::Stats fstat;
-	bool built = false;
-	if (std::strcmp(row->recipe, kRecipeArt) == 0)
-	{
-		double art_ms = 0.0;
-		built = GE1Class3Filter::BuildLanczosAtlas(tight.data(), static_cast<int>(dw), static_cast<int>(dh),
-			row->alpha_clamp, out_rgba, ow, oh, &art_ms);
-		fstat.ms = art_ms;
-	}
-	else
-	{
-		const GE1FontFilter::SfnRow* sfn_rows = sfn ? sfn->rows.data() : nullptr;
-		const int sfn_n = sfn ? static_cast<int>(sfn->rows.size()) : 0;
-		built = GE1FontFilter::BuildFontAtlas(row->atlas, tight.data(), static_cast<int>(dw), static_cast<int>(dh),
-			sfn_rows, sfn_n, out_rgba, ow, oh, &fstat);
-	}
-	if (!built)
+	int reason = 1;
+	if (!GenerateBase4x(*row, sfn, TEX0, TEXA, region, mem, dir, ckey, sfn_digest, cache_on, base,
+			fstat, reason))
 	{
 		lock.lock();
-		s_stats.skipped_geometry++;
+		if (reason == 2)
+			s_stats.skipped_geometry++;
+		else
+			s_stats.skipped_decode++;
 		lock.unlock();
 		return false;
 	}
-
-	// Persist privately (temp + rename, manifest last); loss is normal.
-	// Written with the platform zlib: decode-equal to the oracle's PNGs
-	// everywhere, byte-equal where the compressor matches (Mac harness
-	// proves byte-equality against zlib-ng 1.3.1).
-	if (cache_on)
-	{
-		Error err;
-		FileSystem::CreateDirectoryPath(dir.c_str(), true, &err);
-		const std::string tmp_png = png_path + ".tmp";
-		if (GE1FontFilter::WriteFontPNG(tmp_png, out_rgba.data(), ow, oh) &&
-			FileSystem::RenamePath(tmp_png.c_str(), png_path.c_str(), nullptr))
-		{
-			char man[256];
-			std::snprintf(man, sizeof(man),
-				"ondevice-upscale-manifest-v1\nrecipe=%s sharp=1.0 thresh=64 mode=smoothstep\n"
-				"tex0=%s clut=%s suffix=%s\nsfn=%s\ndims=%ux%u\n",
-				row->recipe, Hex16(row->tex0hash).c_str(), Hex16(row->cluthash).c_str(),
-				Hex8(row->suffix).c_str(), sfn_digest.c_str(), static_cast<unsigned>(ow),
-				static_cast<unsigned>(oh));
-			const std::string tmp_man = man_path + ".tmp";
-			WriteFileAtomic(tmp_man, reinterpret_cast<const std::uint8_t*>(man), std::strlen(man));
-			FileSystem::RenamePath(tmp_man.c_str(), man_path.c_str(), nullptr);
-			lock.lock();
-			TrimCacheLocked(dir);
-			lock.unlock();
-		}
-	}
-
-	unsigned lo = 255, hi = 0;
-	for (std::size_t i = 3; i < out_rgba.size(); i += 4)
-	{
-		lo = out_rgba[i] < lo ? out_rgba[i] : lo;
-		hi = out_rgba[i] > hi ? out_rgba[i] : hi;
-	}
-	*alpha_minmax = {static_cast<std::uint8_t>(lo), static_cast<std::uint8_t>(hi)};
-	out.width = static_cast<std::uint32_t>(ow);
-	out.height = static_cast<std::uint32_t>(oh);
-	// Color (RGBA8) like the pack PNG loader produces, not UNorm8 (A8).
-	out.format = GSTexture::Format::Color;
-	out.alpha_minmax = *alpha_minmax;
-	out.pitch = static_cast<std::uint32_t>(ow) * 4;
-	out.data.assign(out_rgba.begin(), out_rgba.end());
-	int cold_levels = 0;
-	if (row->mip_chain)
-	{
-		cold_levels = AppendMipChain(out_rgba.data(), ow, oh, out.mips);
-		out.generated = true;
-	}
+	const int cold_levels = ServeImage(base, row->mip_chain, out, alpha_minmax);
 	lock.lock();
 	s_stats.generated++;
 	lock.unlock();
-	Console.WriteLn("ODU: generated atlas %d (%dx%d, cells=%d regions=%d mips=%d %.1f ms).", row->atlas, ow, oh,
-		fstat.cells, fstat.regions, cold_levels, fstat.ms);
+	Console.WriteLn("ODU: generated atlas %d (%dx%d, cells=%d regions=%d mips=%d %.1f ms).", row->atlas,
+		base.w, base.h, fstat.cells, fstat.regions, cold_levels, fstat.ms);
 	return true;
 }
 
@@ -675,6 +859,7 @@ void ResetForTests()
 	std::unique_lock<std::mutex> lock(s_lock);
 	s_initialized = false;
 	s_enabled = false;
+	s_prescale = false;
 	s_generation = 0;
 	s_applied_seq = 0;
 	s_sfn[0] = SfnStore();

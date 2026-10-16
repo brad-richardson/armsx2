@@ -45,6 +45,11 @@ void ApplyOnDeviceUpscale(bool enabled, unsigned sequence);
 bool IsEnabled();
 unsigned Generation();
 
+// Prescale switch (GE1_ONDEVICE_UPSCALE_PRESCALE=1, default off): font/word
+// rows are Lanczos-resampled from 4x to the current render scale before
+// upload, cached per (texture, scale). Integer render scales >= 4 skip it.
+bool PrescaleEnabled();
+
 // SFN metrics for atlases 2/72, parsed from the user's own disc files
 // (FEFONT.SFN/HUDFONT.SFN) outside the GS thread. Vendor reads
 // GE1_ONDEVICE_SFN_DIR at open; SetSfnData also serves tests and the
@@ -67,6 +72,8 @@ struct Stats
 	unsigned long long registry_hits = 0;
 	unsigned long long generated = 0;
 	unsigned long long cache_hits = 0;
+	unsigned long long prescale_hits = 0;
+	unsigned long long prescale_generated = 0;
 	unsigned long long cache_corrupt = 0;
 	unsigned long long skipped_disabled = 0;
 	unsigned long long skipped_fmv = 0;

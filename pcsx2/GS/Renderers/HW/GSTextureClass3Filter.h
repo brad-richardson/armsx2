@@ -29,5 +29,12 @@ bool BuildLanczosAtlas(const std::uint8_t* stock_rgba, int w, int h, int alpha_c
 bool BuildMipLevel(const std::uint8_t* prev_rgba, int w, int h,
 	std::vector<std::uint8_t>& out_rgba, int& out_w, int& out_h, double* ms = nullptr);
 
+// Pillow-faithful RGBA resize to arbitrary dims (prescale recipe): the RGB
+// bands through premultiply (half-up) / Pillow-resize / unpremultiply
+// (truncate, clip), alpha straight. Same per-band behavior as BuildMipLevel,
+// which is the W=w/2 H=h/2 case. False on empty input or bad dims.
+bool PillowResizeRGBA(const std::uint8_t* in_rgba, int w, int h,
+	std::vector<std::uint8_t>& out_rgba, int W, int H, double* ms = nullptr);
+
 
 } // namespace GE1Class3Filter
