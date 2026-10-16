@@ -21,6 +21,12 @@ extern bool FMVstarted;
 
 namespace GE1OnDeviceUpscale
 {
+
+// Defined below LookupGenerated's helpers (provider scope, like the rest of
+// the entry points); declared here so ServeImage can build mip chains.
+int AppendMipChain(const std::uint8_t* base_rgba, int w, int h,
+	std::vector<GSTextureReplacements::ReplacementTexture::MipData>& mips);
+
 namespace
 {
 
@@ -466,9 +472,6 @@ int ServeImage(BaseImage& img, bool mip_chain,
 }
 
 } // namespace
-
-int AppendMipChain(const std::uint8_t* base_rgba, int w, int h,
-	std::vector<GSTextureReplacements::ReplacementTexture::MipData>& mips);
 
 void EnsureInitialized()
 {
