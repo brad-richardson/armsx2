@@ -45,9 +45,10 @@ void ApplyOnDeviceUpscale(bool enabled, unsigned sequence);
 bool IsEnabled();
 unsigned Generation();
 
-// Prescale switch (GE1_ONDEVICE_UPSCALE_PRESCALE=1, default off): font/word
-// rows are Lanczos-resampled from 4x to the current render scale before
-// upload, cached per (texture, scale). Integer render scales >= 4 skip it.
+// Prescale switch (default on since ge1-upscale-land, Brad 10-17;
+// GE1_ONDEVICE_UPSCALE_PRESCALE=0 is the off switch): font/word rows are
+// Lanczos-resampled from 4x to the current render scale before upload,
+// cached per (texture, scale). Integer render scales >= 4 skip it.
 bool PrescaleEnabled();
 
 // SFN metrics for atlases 2/72, parsed from the user's own disc files

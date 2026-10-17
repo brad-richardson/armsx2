@@ -490,11 +490,14 @@ void InitializeFromEnvironment()
 		return;
 	s_initialized = true;
 	const char* e = std::getenv("GE1_ONDEVICE_UPSCALE");
-	s_enabled = (e && std::strcmp(e, "1") == 0);
-	// Prescale is init-time only (default off): the lookup path never polls
-	// getenv, and GPU entries are per-boot, so no live purge is needed.
+	// Default on (Brad 10-17): the off switch is GE1_ONDEVICE_UPSCALE=0.
+	// The atlas-111 icon row rides this bit (no per-row knob).
+	s_enabled = !(e && std::strcmp(e, "0") == 0);
+	// Prescale is init-time only (default on; off switch =0): the lookup
+	// path never polls getenv, and GPU entries are per-boot, so no live
+	// purge is needed.
 	const char* pre = std::getenv("GE1_ONDEVICE_UPSCALE_PRESCALE");
-	s_prescale = (pre && std::strcmp(pre, "1") == 0);
+	s_prescale = !(pre && std::strcmp(pre, "0") == 0);
 	if (s_enabled)
 		s_generation = 1;
 	const char* sfn_dir = std::getenv("GE1_ONDEVICE_SFN_DIR");
