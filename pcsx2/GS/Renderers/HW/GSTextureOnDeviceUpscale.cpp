@@ -92,6 +92,11 @@ constexpr RegistryRow kRegistry[] = {
 	{0xbf06df6b73301066ULL, 0x8534e13fe26d2fULL, 0x0000221b, 108, 256, 256, nullptr, kRecipeArt, "art-v1", 128, false}, // bf06df6b73301066-8534e13fe26d2f-0000221b.png
 	{0xda03aa8e6326312dULL, 0x7a7fb9e402163862ULL, 0x0000221b, 109, 256, 256, nullptr, kRecipeArt, "art-v1", 128, false}, // da03aa8e6326312d-7a7fb9e402163862-0000221b.png
 	{0xea247a3102e9bc92ULL, 0x8df23378d89026f4ULL, 0x00001993, 110, 64, 64, nullptr, kRecipeArt, "art-v1", 128, false}, // ea247a3102e9bc92-8df23378d89026f4-00001993.png
+	// Part 2 (Brad 10-16 pick A): frontend icon sheet (medals, folders,
+	// arrows, ?/$/cursors/badges/X, spinner). Whole-sheet Lanczos class
+	// (lanczos-a-v2 = premult Lanczos + Pillow UnsharpMask r2/p50/t3,
+	// alpha clamped to the PS2 peak 128), UI overlay so no mip chain.
+	{0xd0234a4ab65f6b93ULL, 0xbce8b15fb0332877ULL, 0x0000221b, 111, 256, 256, nullptr, kRecipeArt, "art-v1", 128, false}, // d0234a4ab65f6b93-bce8b15fb0332877-0000221b.png
 	{0x10da55cb1ceee898ULL, 0xf93775881c308fd4ULL, 0x00001994, 200, 64, 64, nullptr, kRecipeArt, "art-v1", 128, true}, // 10da55cb1ceee898-f93775881c308fd4-00001994.png
 	{0x24f6ad738370775dULL, 0x5d79a9c2e778f9d9ULL, 0x000019d4, 201, 128, 64, nullptr, kRecipeArt, "art-v1", 128, true}, // 24f6ad738370775d-5d79a9c2e778f9d9-000019d4.png
 	{0x2f53aff7afe1a355ULL, 0x5d79a9c2e778f9d9ULL, 0x00001594, 202, 64, 32, nullptr, kRecipeArt, "art-v1", 128, true}, // 2f53aff7afe1a355-5d79a9c2e778f9d9-00001594.png
